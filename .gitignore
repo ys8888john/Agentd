@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 构建产物（Rust 残留，本项目已转向 Python）
+target/
+
+# 临时脚本（已被 tests/ 取代）
+check.py
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
