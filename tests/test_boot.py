@@ -10,8 +10,9 @@ import os
 
 import pytest
 
-from agentd.boot import _parse_dotenv, load_dotenv, load_settings
+from agentd.boot import _parse_dotenv, build_kernel, build_store, load_dotenv, load_settings
 from agentd.kernel.llm import AUTO
+from agentd.kernel.store import InMemorySessionStore, SqliteSessionStore
 
 
 # ---- _parse_dotenv ----
@@ -117,3 +118,51 @@ def test_settings_think_flag_parsing(monkeypatch, value, expected):
     monkeypatch.setenv("AGENTD_OLLAMA_THINK", value)
     monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
     assert load_settings().ollama_think is expected
+
+
+# ---- 存储接线 ----
+
+def test_settings_default_store_is_sqlite(monkeypatch):
+    """默认是持久化的 —— 想要"重启即丢"得显式声明，不能反过来。"""
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.delenv("AGENTD_STORE", raising=False)
+    assert load_settings().store_backend == "sqlite"
+
+
+def test_build_kernel_uses_sqlite_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_LLM_BACKEND", "fake")
+    monkeypatch.setenv("AGENTD_DB_PATH", str(tmp_path / "sessions.db"))
+
+    k = build_kernel()
+    assert isinstance(k.store, SqliteSessionStore)
+    k.store.close()  # type: ignore[attr-defined]
+
+
+def test_build_store_memory_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_STORE", "memory")
+    # 内存后端不该在磁盘上留下任何东西
+    assert isinstance(build_store(), InMemorySessionStore)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_build_store_unknown_backend_raises(monkeypatch):
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_STORE", "redis")
+    with pytest.raises(ValueError, match="未知存储后端"):
+        build_store()
+
+
+def test_build_store_reports_unusable_db_path(tmp_path, monkeypatch):
+    """打不开库要报错 + 给出退路，不能静默退回内存（那会丢数据还查不出来）。"""
+    blocker = tmp_path / "iam_a_file"
+    blocker.write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_STORE", "sqlite")
+    # 让一个普通文件当父目录 —— mkdir 必然失败，且与权限无关
+    monkeypatch.setenv("AGENTD_DB_PATH", str(blocker / "sessions.db"))
+
+    with pytest.raises(RuntimeError, match="AGENTD_STORE=memory"):
+        build_store()

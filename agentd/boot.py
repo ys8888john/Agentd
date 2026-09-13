@@ -10,11 +10,18 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from .kernel.kernel import AgentKernel
 from .kernel.llm import DEFAULT_PREFER, LLM, OllamaNativeLLM, OpenAICompatLLM
+from .kernel.store import (
+    InMemorySessionStore,
+    SessionStore,
+    SqliteSessionStore,
+    default_db_path,
+)
 
 ENV_PREFIXES = ("AGENTD_", "FORGEAGENT_")
 
@@ -78,6 +85,8 @@ class Settings:
     openai_api_key: str
     fake_reply: str
     system_prompt: str | None
+    store_backend: str          # sqlite | memory
+    db_path: str
 
 
 def load_settings() -> Settings:
@@ -95,6 +104,8 @@ def load_settings() -> Settings:
         openai_api_key=_env("AGENTD_OPENAI_API_KEY", "ollama"),
         fake_reply=_env("AGENTD_FAKE_REPLY", "这是 FakeLLM 的固定回复。"),
         system_prompt=os.getenv("AGENTD_SYSTEM_PROMPT") or None,
+        store_backend=_env("AGENTD_STORE", "sqlite").lower(),
+        db_path=_env("AGENTD_DB_PATH", str(default_db_path())),
     )
 
 
@@ -121,6 +132,26 @@ def build_llm(settings: Settings | None = None) -> LLM:
     raise ValueError(f"未知 LLM 后端: {s.backend}")
 
 
+def build_store(settings: Settings | None = None) -> SessionStore:
+    """按配置造存储。默认 SQLite —— 持久化是默认行为，不持久化才要显式声明。"""
+    s = settings or load_settings()
+    if s.store_backend == "sqlite":
+        try:
+            return SqliteSessionStore(s.db_path)
+        except (sqlite3.Error, OSError) as exc:
+            # 不静默退回内存：那会让"我明明聊过，重启后没了"变成一个查不出来的问题。
+            # 把退路写进报错里，让人自己选。
+            raise RuntimeError(
+                f"打不开会话库 {s.db_path}: {exc}\n"
+                f"  可设 AGENTD_DB_PATH 换个位置，或 AGENTD_STORE=memory 退回内存存储（重启即丢）。"
+            ) from exc
+    if s.store_backend == "memory":
+        return InMemorySessionStore()
+    raise ValueError(f"未知存储后端: {s.store_backend}")
+
+
 def build_kernel(settings: Settings | None = None) -> AgentKernel:
     s = settings or load_settings()
-    return AgentKernel(llm=build_llm(s), system=s.system_prompt)
+    return AgentKernel(
+        llm=build_llm(s), store=build_store(s), system=s.system_prompt
+    )

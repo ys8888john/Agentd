@@ -20,6 +20,11 @@ check.py
 # 本地配置（含模型偏好等个人设定，不进仓库）
 .env
 
+# SQLite 会话库（默认在 ~/.agentd，但也可能被 AGENTD_DB_PATH 指到项目里）
+*.db
+*.db-wal
+*.db-shm
+
 # 编辑器 / 系统
 .idea/
 .vscode/
