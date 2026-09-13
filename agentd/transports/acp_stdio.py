@@ -1,14 +1,12 @@
 """ACP over stdio 传输适配器 —— 主线出口。
 
-职责单一：把 kernel.handle() 产出的 Event 翻译成 ACP session/update 通知，
-把客户端发来的 session/prompt 翻译成内核的一次 handle()。
+把 kernel.handle() 产出的 Event 翻译成 ACP session/update 通知，
+把客户端发来的 session/prompt 翻译成一次 handle()。
 
-三条硬约束（违反即协议错误，客户端会静默卡死或报解析失败）：
-1. stdout 上只能有 JSON-RPC 帧。任何 print() / logging.StreamHandler 都会污染协议，
-   日志一律走 stderr。这条不靠自觉，靠 tests/test_acp.py 断言 stdout 每行都能 JSON 解析。
-2. 路径必须是绝对路径；行号 1-based。
-3. 判断能力用 initialize 协商回来的 protocolVersion，不能看 SDK 版本号
-   （本 SDK 是 0.12.1，wire version 是 1，两者不对应）。
+三条硬约束（违反即协议错误，客户端会静默卡死或解析失败）：
+1. stdout 只能有 JSON-RPC 帧，日志走 stderr（tests/test_acp.py 断言 stdout 每行可 JSON 解析）；
+2. 路径必须是绝对路径，行号 1-based；
+3. 能力判断用 initialize 协商的 protocolVersion，不能看 SDK 版本号。
 """
 
 from __future__ import annotations
@@ -63,8 +61,6 @@ class AgentdAcpAgent(Agent):
         self._conn = conn
         self._log("[agentd] ACP 连接已建立")
 
-    # ---- 生命周期 ----
-
     async def initialize(
         self,
         protocol_version: int,
@@ -108,8 +104,6 @@ class AgentdAcpAgent(Agent):
         """目前只记日志 —— 真正的中断要让内核在 handle() 里响应取消信号。"""
         self._log(f"[agentd] 收到取消请求 session={session_id}（暂未实现中断）")
 
-    # ---- 核心 ----
-
     async def prompt(
         self, session_id: str, prompt: list[Any], **kwargs: Any
     ) -> PromptResponse:
@@ -149,8 +143,6 @@ class AgentdAcpAgent(Agent):
                 self._log(f"[agentd] 暂未映射的事件类型: {event.type}")
 
         return PromptResponse(stop_reason=stop_reason)
-
-    # ---- 辅助 ----
 
     def _extract_text(self, blocks: list[Any]) -> str:
         parts: list[str] = []

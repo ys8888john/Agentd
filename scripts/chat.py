@@ -1,22 +1,4 @@
-"""本地调试用的最小 ACP 客户端（REPL）。
-
-不走 SDK 的 spawn_agent_process —— 它签名跨版本变过（factory 风格 vs 直接传实例）。
-这里手写 JSON-RPC 帧，跟 tests/test_acp.py 用同一套约定，稳。
-
-用法（在 WSL2 里）：
-    cd /root/workspace/Agentd
-
-    # 不连真实模型，验证链路通不通
-    AGENTD_LLM_BACKEND=fake python scripts/chat.py
-
-    # 连本机 Ollama（默认 qwen3）
-    AGENTD_LLM_BACKEND=ollama python scripts/chat.py
-
-    # 换模型
-    AGENTD_LLM_BACKEND=ollama AGENTD_OLLAMA_MODEL=qwen2.5:7b python scripts/chat.py
-
-直接回车退出。
-"""
+"""本地联调脚本：手动发一条 prompt 给 Agentd，通过真实 stdio ACP 看流式回复。"""
 
 from __future__ import annotations
 

@@ -1,15 +1,4 @@
-"""contracts.py 的单元测试。
-
-运行方式（项目已配好 pytest，testpaths = ["tests"]）：
-
-    .venv/bin/python -m pytest -q
-
-覆盖范围：
-- 每个 Event 模型的字段约束（Literal 取值、默认值）
-- 判别联合 EventAdapter：正确路由、脏数据拒绝、错误信息质量
-- to_sse：SSE 帧格式、type 字段始终出现（不随 exclude_defaults 消失）
-- 三个 new_*_id 工具：前缀、长度、唯一性、格式稳定性
-"""
+"""contracts.py 单元测试：Event 联合类型序列化、SSE 帧格式、session/run id 必填约束。"""
 
 import json
 
@@ -31,9 +20,7 @@ from agentd.contracts import (
 )
 
 
-# ---------------------------------------------------------------------------
 # 公共基类：session_id / run_id 必填
-# ---------------------------------------------------------------------------
 
 def test_event_base_requires_session_and_run_id():
     with pytest.raises(ValidationError):
@@ -42,9 +29,7 @@ def test_event_base_requires_session_and_run_id():
         MessageDelta(session_id="s", text="hi")  # 缺 run_id
 
 
-# ---------------------------------------------------------------------------
 # MessageDelta
-# ---------------------------------------------------------------------------
 
 def test_message_delta_accepts_only_its_type():
     m = MessageDelta(session_id="s1", run_id="r1", text="你好")
@@ -63,9 +48,7 @@ def test_message_delta_type_is_defaulted():
     assert m.model_dump()["type"] == "message_delta"
 
 
-# ---------------------------------------------------------------------------
 # MessageDone
-# ---------------------------------------------------------------------------
 
 def test_message_done_roundtrip():
     m = MessageDone(session_id="s1", run_id="r1", text="完整文本")
@@ -73,9 +56,7 @@ def test_message_done_roundtrip():
     assert m.text == "完整文本"
 
 
-# ---------------------------------------------------------------------------
 # ToolCallStart：多值 Literal 的 kind
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["read", "edit", "execute", "generic"])
 def test_tool_call_start_accepts_all_kinds(kind):
@@ -94,9 +75,7 @@ def test_tool_call_start_kind_defaults_to_generic():
     assert t.kind == "generic"
 
 
-# ---------------------------------------------------------------------------
 # ToolCallDone：status 默认值 / output 默认值
-# ---------------------------------------------------------------------------
 
 def test_tool_call_done_defaults():
     d = ToolCallDone(session_id="s1", run_id="r1", call_id="c1")
@@ -116,9 +95,7 @@ def test_tool_call_done_rejects_invalid_status():
         ToolCallDone(session_id="s1", run_id="r1", call_id="c1", status="pending")
 
 
-# ---------------------------------------------------------------------------
 # ErrorEvent
-# ---------------------------------------------------------------------------
 
 def test_error_event_roundtrip():
     e = ErrorEvent(session_id="s1", run_id="r1", message="boom")
@@ -126,9 +103,7 @@ def test_error_event_roundtrip():
     assert e.message == "boom"
 
 
-# ---------------------------------------------------------------------------
 # Done：stop_reason 默认值 + 取值
-# ---------------------------------------------------------------------------
 
 def test_done_defaults_to_end_turn():
     d = Done(session_id="s1", run_id="r1")
@@ -147,9 +122,7 @@ def test_done_rejects_invalid_stop_reason():
         Done(session_id="s1", run_id="r1", stop_reason="timeout")
 
 
-# ---------------------------------------------------------------------------
 # 判别联合 EventAdapter：核心契约
-# ---------------------------------------------------------------------------
 
 def test_adapter_routes_by_type():
     cases = {
@@ -192,9 +165,7 @@ def test_adapter_validate_python_routes():
     assert isinstance(ev, Done)
 
 
-# ---------------------------------------------------------------------------
 # to_sse：SSE 帧格式
-# ---------------------------------------------------------------------------
 
 def test_to_sse_format():
     m = MessageDelta(session_id="s", run_id="r", text="hi")
@@ -221,9 +192,7 @@ def test_to_sse_carries_json_payload():
     assert payload["type"] == "message_delta"
 
 
-# ---------------------------------------------------------------------------
 # new_*_id 工具函数
-# ---------------------------------------------------------------------------
 
 def test_new_session_id_prefix_and_length():
     sid = new_session_id()

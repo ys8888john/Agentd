@@ -35,9 +35,7 @@ class AgentKernel:
     def __post_init__(self) -> None:
         self._modes: dict[str, Mode] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self.register(SingleMode()) # 第一步只有这一种
-
-    # ---- 模式注册 ----
+        self.register(SingleMode())
 
     def register(self, mode: Mode) -> None:
         if not mode.name:
@@ -53,8 +51,6 @@ class AgentKernel:
         except KeyError as exc:
             raise UnknownModeError(name) from exc
 
-    # ---- 会话 ----
-
     async def create_session(self) -> str:
         session_id = new_session_id()
         await self.store.create(session_id)
@@ -64,16 +60,14 @@ class AgentKernel:
         return await self.store.history(session_id)
 
     async def validate(self, session_id: str, mode: str) -> None:
-        """提前校验参数，失败抛 UnknownSessionError / UnknownModeError。
+        """提前校验参数（会话存在 + 模式已注册），失败抛 UnknownSessionError / UnknownModeError。
 
-        存在的理由：handle() 是异步生成器，函数体要等到第一次 __anext__ 才执行，
-        那时 HTTP 响应头已经发出去了，没法再改成 404。传输层必须先调这个方法。
+        理由：handle() 是异步生成器，代码要等到首次 __anext__ 才执行，届时响应头已发出，
+        无法再改成错误状态，故传输层必须先调本方法。
         """
         if not await self.store.exists(session_id):
             raise UnknownSessionError(session_id)
         self._get_mode(mode)
-    
-    # ---- 执行 ----
 
     async def handle(
         self,
@@ -84,10 +78,8 @@ class AgentKernel:
     ) -> AsyncIterator[Event]:
         """执行一次对话，产出事件流。
 
-        约定：
-        1. 无论成功失败，最后一个事件一定是 Done；
-        2. 失败时先发 ErrorEvent 再发 Done(stop_reason="error")；
-        3. 同一个 session 的多次 handle 串行执行（history 是有序的，并行会写乱）。
+        约定：末尾必发 Done；失败时先 ErrorEvent 再 Done(stop_reason="error")；
+        同一 session 多次 handle 串行执行（history 有序，并行会写乱）。
         """
 
         if not await self.store.exists(session_id):

@@ -1,13 +1,4 @@
-"""kernel/models.py 的单元测试。
-
-运行：.venv/bin/python -m pytest -q
-
-覆盖范围：
-- Role 字面量取值约束
-- Message 字段：role 必填且受 Role 约束、content 默认值、name 可空语义
-- model_dump / model_dump(exclude_none=True) 与 OpenAI 格式的契合
-- 工厂方法 user / system / assistant（原 assistent 拼写 bug 已修复）
-"""
+"""models.py 单元测试：Message 工厂、Literal 约束、model_dump 兼容 OpenAI、历史追加与 tool 消息序列化。"""
 
 import pytest
 from pydantic import ValidationError
@@ -15,9 +6,7 @@ from pydantic import ValidationError
 from agentd.kernel.models import Message, Role
 
 
-# ---------------------------------------------------------------------------
 # Role 字面量
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("role", ["system", "user", "assistant", "tool"])
 def test_role_accepts_valid(role):
@@ -31,9 +20,7 @@ def test_role_rejects_invalid(bad):
         Message(role=bad, content="x")
 
 
-# ---------------------------------------------------------------------------
 # Message 基础字段
-# ---------------------------------------------------------------------------
 
 def test_message_requires_role():
     with pytest.raises(ValidationError):
@@ -50,9 +37,7 @@ def test_content_accepts_string():
     assert m.content == "你好"
 
 
-# ---------------------------------------------------------------------------
 # name 字段：str 或 None，默认 None
-# ---------------------------------------------------------------------------
 
 def test_name_defaults_to_none():
     m = Message(role="user")
@@ -69,9 +54,7 @@ def test_name_rejects_non_str_non_none():
         Message(role="tool", content="x", name=123)
 
 
-# ---------------------------------------------------------------------------
 # 序列化：对齐 OpenAI /chat/completions 格式
-# ---------------------------------------------------------------------------
 
 def test_model_dump_openai_shape():
     m = Message(role="user", content="hi")
@@ -103,9 +86,7 @@ def test_roundtrip_via_json():
     assert m2.name is None
 
 
-# ---------------------------------------------------------------------------
 # 工厂方法
-# ---------------------------------------------------------------------------
 
 def test_factory_user():
     m = Message.user("hi")

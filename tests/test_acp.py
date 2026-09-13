@@ -1,9 +1,4 @@
-"""ACP 端到端：真的起一个子进程，走完整链路。
-
-刻意不走 SDK 的 spawn_agent_process —— 它在不同版本间签名变过
-（factory 风格 vs 直接传实例）。手写 JSON-RPC 帧反而更稳，
-而且顺带能断言"stdout 每行都是合法 JSON"这条最容易坏的约束。
-"""
+"""ACP(stdio) 端到端测试：起真实子进程验证 JSON-RPC 帧、会话链路与错误转译。"""
 
 from __future__ import annotations
 

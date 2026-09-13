@@ -1,13 +1,4 @@
-"""llm.py 的单元测试。
-
-覆盖点：
-- LLMError 异常类型
-- LLM.complete() 默认基于 stream() 拼接
-- _with_system() 把 system 塞到最前、剔除 name=None
-- FakeLLM 流式切分行为
-- OllamaNativeLLM / OpenAICompatLLM 的请求构造（用 httpx.AsyncClient mock）
-- 已知拼写坑的锁定测试（AsyncIterator / AsyncItrator 注解未定义名字）
-"""
+"""llm.py 单元测试：stream()/complete()/错误处理，以及 Ollama / OpenAI 兼容后端的直连行为。"""
 
 import json
 from collections.abc import AsyncGenerator
@@ -81,18 +72,14 @@ class _FakeClient:
         return False
 
 
-# --------------------------------------------------------------------------- #
 # LLMError
-# --------------------------------------------------------------------------- #
 def test_llm_error_is_runtime_error():
     err = LLMError("boom")
     assert isinstance(err, RuntimeError)
     assert str(err) == "boom"
 
 
-# --------------------------------------------------------------------------- #
 # _with_system
-# --------------------------------------------------------------------------- #
 def test_with_system_prepends_when_given():
     out = _with_system([Message.user("hi")], system="sys")
     assert out[0] == {"role": "system", "content": "sys"}
@@ -113,9 +100,7 @@ def test_with_system_strips_none_name():
     assert out[1] == {"role": "user", "content": "hi"}
 
 
-# --------------------------------------------------------------------------- #
 # LLM.complete (默认实现基于 stream 拼接)
-# --------------------------------------------------------------------------- #
 async def test_complete_concatenates_stream():
     llm = FakeLLM(reply="abcdefg", chunk_size=3)
     result = await llm.complete([Message.user("hi")])
@@ -136,9 +121,7 @@ async def test_complete_passes_system():
     assert seen["system"] == "SYS"
 
 
-# --------------------------------------------------------------------------- #
 # FakeLLM 流式切分
-# --------------------------------------------------------------------------- #
 async def test_fakellm_yields_chunks():
     llm = FakeLLM(reply="abcdefgh", chunk_size=3)
     chunks = [c async for c in llm.stream([Message.user("hi")])]
@@ -157,9 +140,7 @@ async def test_fakellm_default_reply():
     assert out == "这是 FakeLLM 的固定回复"
 
 
-# --------------------------------------------------------------------------- #
 # OllamaNativeLLM —— 请求体构造 + NDJSON 解析
-# --------------------------------------------------------------------------- #
 async def test_ollama_native_builds_body(monkeypatch):
     class FakeClient(_FakeClient):
         _lines = [
@@ -227,9 +208,7 @@ async def test_ollama_native_skips_empty_content(monkeypatch):
     assert chunks == ["data"]
 
 
-# --------------------------------------------------------------------------- #
 # OpenAICompatLLM —— SSE 解析
-# --------------------------------------------------------------------------- #
 async def test_openai_compat_parses_sse(monkeypatch):
     class FakeClient(_FakeClient):
         _lines = [
@@ -265,9 +244,7 @@ async def test_openai_compat_skips_non_data_lines(monkeypatch):
     assert chunks == ["x"]
 
 
-# --------------------------------------------------------------------------- #
 # 已知拼写坑的锁定测试（与 models.py 的 assistent 拼写坑同惯例）
-# --------------------------------------------------------------------------- #
 def test_ollama_stream_return_annotation_is_asyncgenerator():
     """OllamaNativeLLM.stream 的返回注解必须是 AsyncIterator。
 
