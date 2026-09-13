@@ -56,8 +56,15 @@ class AgentdAcpAgent(Agent):
         """唯一允许的日志出口 —— 必须是 stderr。"""
         print(msg, file=sys.stderr, flush=True)
 
-    async def on_connect(self, conn: Any) -> None:
-        # SDK 建立连接后回调，拿到 conn 才能反向调用 session_update
+    def on_connect(self, conn: Any) -> None:
+        """SDK 建立连接后回调，拿到 conn 才能反向调用 session_update。
+
+        必须是**同步** def，不能写成 async def：
+        SDK 是 `on_connect(self)` 直接调用，不 await（见 acp/agent/connection.py:101-102）。
+        写成 async 的话，调用只会生成一个从未被执行的协程，self._conn 永远是 None，
+        直到 prompt() 里才炸 "'NoneType' object has no attribute 'session_update'"——
+        报错点离病根十万八千里，极难定位。
+        """
         self._conn = conn
         self._log("[agentd] ACP 连接已建立")
 

@@ -37,20 +37,20 @@ class InMemorySessionStore(SessionStore):
     async def create(self, session_id: str) -> None:
         self._sessions.setdefault(session_id, [])
 
-    async def exists(self, session_id: str):
+    async def exists(self, session_id: str) -> bool:
         return session_id in self._sessions
 
     async def append(self, session_id: str, message: Message) -> None:
-        if self.exists(session_id) != True:
+        if not await self.exists(session_id):
             raise UnknownSessionError(session_id)
         self._sessions[session_id].append(message)
 
-    async def history(self, session_id) -> list[Message]:
-        if self.exists(session_id) != True:
+    async def history(self, session_id: str) -> list[Message]:
+        if not await self.exists(session_id):
             raise UnknownSessionError(session_id)
         return self._sessions[session_id]
 
-    async def clear(self, session_id) -> None:
-        if self.exists(session_id) != True:
+    async def clear(self, session_id: str) -> None:
+        if not await self.exists(session_id):
             raise UnknownSessionError(session_id)
         self._sessions[session_id] = []

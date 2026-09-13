@@ -16,11 +16,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPLY = "端到端测试回复"
 
 
-def _method(name: str) -> str:
-    """从 SDK 的常量表里取 wire 方法名，不硬编码字符串。"""
+def _method(name: str, fallback: str = "") -> str:
+    """从 SDK 的常量表里取 wire 方法名，不硬编码字符串。
+
+    两个坑，都踩过：
+    1. key 是 SDK 里的 python 风格全名（session_new / session_prompt / session_cancel），
+       不是省掉 session_ 前缀的简写。写成 "new_session" / "prompt" 会 KeyError。
+    2. 取不到必须兜底，不能让整个测试因为 SDK 改个 key 就崩。
+       宁可用字面量跑下去，也不要一片红。
+    """
+    value = None
     if isinstance(AGENT_METHODS, dict):
-        return AGENT_METHODS[name]
-    return getattr(AGENT_METHODS, name)
+        value = AGENT_METHODS.get(name)
+    else:
+        value = getattr(AGENT_METHODS, name, None)
+    if isinstance(value, str):
+        return value
+    return fallback or name
 
 
 def _collect_text(node: Any) -> str:
@@ -120,7 +132,7 @@ async def test_full_prompt_flow(agent: _Proc):
     )
 
     resp, _ = await agent.call(
-        2, _method("new_session"), {"cwd": str(PROJECT_ROOT), "mcpServers": []}
+        2, _method("session_new", "session/new"), {"cwd": str(PROJECT_ROOT), "mcpServers": []}
     )
     assert "error" not in resp, resp
     session_id = resp["result"]["sessionId"]
@@ -128,7 +140,7 @@ async def test_full_prompt_flow(agent: _Proc):
 
     resp, updates = await agent.call(
         3,
-        _method("prompt"),
+        _method("session_prompt", "session/prompt"),
         {"sessionId": session_id, "prompt": [{"type": "text", "text": "你好"}]},
     )
     assert "error" not in resp, resp
@@ -143,7 +155,7 @@ async def test_unknown_session_is_reported_as_error(agent: _Proc):
 
     resp, _ = await agent.call(
         2,
-        _method("prompt"),
+        _method("session_prompt", "session/prompt"),
         {"sessionId": "sess_not_exist", "prompt": [{"type": "text", "text": "x"}]},
     )
     # 内核抛 UnknownSessionError，SDK 应当转成 JSON-RPC error，而不是静默成功
