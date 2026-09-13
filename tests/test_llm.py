@@ -7,11 +7,14 @@ import httpx
 import pytest
 
 from agentd.kernel.llm import (
+    AUTO,
     LLM,
     LLMError,
     FakeLLM,
     OllamaNativeLLM,
     OpenAICompatLLM,
+    list_ollama_models,
+    pick_model,
     _with_system,
 )
 from agentd.kernel.models import Message
@@ -21,15 +24,22 @@ class _FakeStreamCtx:
     """模拟 client.stream() 返回的异步上下文管理器。
 
     llm.py 里用 `async with client.stream(...) as resp:` 拿到 resp，
-    然后 `resp.raise_for_status()` + `async for line in resp.aiter_lines()`。
-    所以这个对象需要同时提供 raise_for_status 和 aiter_lines。
+    然后先看 `resp.status_code`，再 `async for line in resp.aiter_lines()`。
+    所以这个对象需要同时提供 status_code / aread / aiter_lines。
+    status_code 默认 200 —— 真实 httpx.Response 一定有这个属性，
+    假对象缺了它，llm.py 里那句 `if resp.status_code >= 400` 会直接 AttributeError。
     """
+
+    status_code = 200
 
     def __init__(self, lines):
         self._lines = lines
 
     def raise_for_status(self):
         return None
+
+    async def aread(self):
+        return b""
 
     async def aiter_lines(self):
         for line in self._lines:
@@ -272,3 +282,195 @@ def test_fake_stream_return_annotation_is_asynciterator():
     assert "AsyncIterator" in str(ann)
     # 注解里引用的名字必须真的能解析到，否则 get_type_hints() 会炸
     assert AsyncIterator is not None
+
+
+# ---------------------------------------------------------------------------
+# 模型自动探测（AGENTD_OLLAMA_MODEL=auto）
+#
+# 这一段存在的理由：默认模型名写死成 qwen3，但这台机器上装的是 qwen3.5:9b-text，
+# Ollama 返回 404，而 404 的表现是"回复一片空白、stop_reason 还是 end_turn"——
+# 用户完全无从下手。auto 就是为了让"换台机器也能开箱即通"。
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    """给 list_ollama_models 用的 GET 响应替身。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeGetClient:
+    """只实现 get() 的 AsyncClient 替身，用来喂 /api/tags 的结果。"""
+
+    payload: dict = {}
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def get(self, url, **k):
+        type(self).captured_url = url
+        return _FakeResponse(type(self).payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _tags(*names, caps=("completion",)):
+    return {
+        "models": [
+            {"name": n, "capabilities": list(caps)} for n in names
+        ]
+    }
+
+
+def test_pick_model_prefers_earlier_token():
+    assert pick_model(["llama3:8b", "qwen3.5:9b-text"], "qwen3.5,llama") == "qwen3.5:9b-text"
+
+
+def test_pick_model_falls_back_to_first_when_no_match():
+    assert pick_model(["mistral:7b", "phi:latest"], "qwen3.5,qwen3") == "mistral:7b"
+
+
+def test_pick_model_prefer_is_case_insensitive():
+    assert pick_model(["Qwen3.5:9b"], "QWEN3.5") == "Qwen3.5:9b"
+
+
+def test_pick_model_on_empty_list_raises():
+    with pytest.raises(LLMError):
+        pick_model([])
+
+
+async def test_list_ollama_models_filters_embedding_only(monkeypatch):
+    class C(_FakeGetClient):
+        payload = {
+            "models": [
+                {"name": "bge-m3", "capabilities": ["embedding"]},
+                {"name": "qwen3.5:9b-text", "capabilities": ["completion"]},
+            ]
+        }
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+    assert await list_ollama_models("http://h:11434") == ["qwen3.5:9b-text"]
+
+
+async def test_list_ollama_models_keeps_all_when_no_capabilities_field(monkeypatch):
+    """老版本 Ollama 不返回 capabilities —— 那就都留着，宁可多不能少。"""
+
+    class C(_FakeGetClient):
+        payload = {"models": [{"name": "qwen3:8b"}, {"name": "llama3:8b"}]}
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+    assert await list_ollama_models("http://h:11434") == ["qwen3:8b", "llama3:8b"]
+
+
+async def test_auto_model_resolves_once_and_is_used_in_body(monkeypatch):
+    """auto 时：查一次 /api/tags，挑中的模型进请求体，并且只查一次。"""
+
+    calls = {"n": 0}
+
+    class GetClient(_FakeGetClient):
+        payload = _tags("qwen3.5:9b-text", "qwen3:8b")
+
+        async def get(self, url, **k):
+            calls["n"] += 1
+            return await super().get(url, **k)
+
+    class StreamClient(_FakeClient):
+        _lines = [json.dumps({"message": {"content": "ok"}, "done": True})]
+
+    # 同一个替身要同时支持 get 和 stream
+    class Both(GetClient, StreamClient):
+        pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", Both)
+
+    llm = OllamaNativeLLM(model=AUTO)
+    chunks = [c async for c in llm.stream([Message.user("hi")])]
+    # 再来一次，验证解析结果被缓存、不会重复查询
+    chunks += [c async for c in llm.stream([Message.user("hi")])]
+
+    assert chunks == ["ok", "ok"]
+    assert calls["n"] == 1
+    assert llm._resolved == "qwen3.5:9b-text"
+    # captured 记在 type(self) 上，也就是 Both
+    assert Both.captured["json"]["model"] == "qwen3.5:9b-text"
+
+
+async def test_explicit_model_skips_tagging(monkeypatch):
+    """显式指定了模型就别去问 Ollama —— 少一次网络往返，也避免依赖 tags 端点。"""
+    calls = {"n": 0}
+
+    class Both(_FakeGetClient, _FakeClient):
+        payload = _tags("qwen3.5:9b-text")
+        _lines = [json.dumps({"message": {"content": "ok"}, "done": True})]
+
+        async def get(self, url, **k):
+            calls["n"] += 1
+            return await super().get(url, **k)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Both)
+
+    llm = OllamaNativeLLM(model="my-model")
+    async for _ in llm.stream([Message.user("hi")]):
+        pass
+
+    assert calls["n"] == 0
+    assert Both.captured["json"]["model"] == "my-model"
+
+
+async def test_httpx_404_body_is_surfaced(monkeypatch):
+    """模型不存在时，Ollama 那句 'model not found' 必须出现在异常里。
+
+    以前这里只抛裸的 HTTPStatusError，传输出去后前端看到的是一片空白。
+    """
+
+    class Ctx(_FakeStreamCtx):
+        status_code = 404
+
+        async def aread(self):
+            return b'{"error":"model \'qwen3\' not found"}'
+
+    class C(_FakeClient):
+        _lines = []
+
+        def stream(self, method, url, json=None, headers=None):
+            type(self).captured = {"json": json}
+            return Ctx([])
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+
+    llm = OllamaNativeLLM(model="qwen3")
+    with pytest.raises(LLMError) as exc:
+        async for _ in llm.stream([Message.user("hi")]):
+            pass
+
+    msg = str(exc.value)
+    assert "404" in msg
+    assert "not found" in msg
+    assert "qwen3" in msg
+
+
+async def test_connect_error_gives_actionable_hint(monkeypatch):
+    """连不上 Ollama 时，提示要指向具体动作，而不是甩一个 ConnectError。"""
+
+    class C(_FakeClient):
+        def stream(self, method, url, json=None, headers=None):
+            raise httpx.ConnectError("[Errno 10061] 连不上")
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+
+    llm = OllamaNativeLLM(model="qwen3")
+    with pytest.raises(LLMError) as exc:
+        async for _ in llm.stream([Message.user("hi")]):
+            pass
+
+    assert "ollama serve" in str(exc.value)
