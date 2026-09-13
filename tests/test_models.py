@@ -6,7 +6,7 @@
 - Role 字面量取值约束
 - Message 字段：role 必填且受 Role 约束、content 默认值、name 可空语义
 - model_dump / model_dump(exclude_none=True) 与 OpenAI 格式的契合
-- 工厂方法 user / system / assistent（注：assistent 目前有拼写 bug，见末尾）
+- 工厂方法 user / system / assistant（原 assistent 拼写 bug 已修复）
 """
 
 import pytest
@@ -120,12 +120,14 @@ def test_factory_system():
     assert m.content == "sys"
 
 
-def test_factory_assistent_is_broken_due_to_typo():
-    """已知 bug：assistent() 内部把 role 写成 "assistent"（应为 "assistant"），
-    会触发 Role 的 Literal 校验失败。此测试用于锁定该回归，修复后应改为 test_factory_assistant。
-
-    修复方式：把 models.py 第 40-41 行的 role="assistent" 改为 "assistant"，
-    并建议把方法名也修正为 assistant。
+def test_factory_assistant():
+    """原来这里锁的是 assistent 拼写 bug（方法名和 role 都写成了 "assistent"），
+    现已修复 —— 方法名改回 assistant，role 也改回合法的 "assistant"。
     """
+    m = Message.assistant("hi")
+    assert m.role == "assistant"
+    assert m.content == "hi"
+
+    # role 拼错仍然必须被 Literal 拦住
     with pytest.raises(ValidationError):
-        Message.assistent("hi")
+        Message(role="assistent", content="hi")
