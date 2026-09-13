@@ -1,0 +1,10 @@
+# 统一用 LF。
+#
+# 为什么需要这个文件：仓库开发横跨 Windows 和 WSL2 两侧，Windows 上 git
+# 默认 core.autocrlf=true，检出时把 LF 转成 CRLF、提交时再转回来——只要全程
+# 用 git 就不会出问题。但一旦有工具绕过这个约定直接写文件（编辑器、脚本），
+# CRLF 就会被原样提交进去，后果是每个文件的 diff 都变成"整文件重写"，
+# 真实改动被淹没，review 等于失效。
+#
+# eol=lf 是强制性的：不管各人本机 autocrlf 怎么配，检出到工作区一律 LF。
+* text=auto eol=lf
