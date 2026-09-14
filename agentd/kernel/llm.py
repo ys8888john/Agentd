@@ -449,3 +449,58 @@ class FakeLLM(LLM):
         text = self.reply
         for i in range(0, len(text), self.chunk_size):
             yield LLMText(text[i: i + self.chunk_size])
+
+
+class ScriptLLM(LLM):
+    """按脚本回放模型的输出（文本 / 工具调用），给端到端测试和本地演示用。
+
+    存在的理由：本机的小模型（qwen3.5 之类）不一定真的会吐 tool_calls，
+    "MCP 通不通"就不该赌在模型的工具调用能力上。有了它，
+    「内核 → MCP → 回灌 → 再调」这条链路可以在没有任何真实模型时钉死，
+    CI 里也能跑（Ollama 没起、没有 key 都不影响）。
+
+    脚本是一个 JSON 数组，每次调用取一条；用完之后一直重复最后一条
+    （免得模型不收敛时抛异常掩盖真正的问题）：
+
+        [
+          {"tool_calls": [{"name": "echo__echo", "arguments": {"text": "hi"}}]},
+          {"text": "工具说：echo: hi"}
+        ]
+
+    每条可含 `text`（先按 chunk_size 分段吐出）与 `tool_calls`
+    （每项 name 必填，arguments 可以是对象或 JSON 字符串，id 缺省自动生成）。
+    """
+
+    def __init__(self, script: list[dict] | str, chunk_size: int = 12) -> None:
+        if isinstance(script, str):
+            script = json.loads(script)
+        steps = [s for s in (script or []) if isinstance(s, dict)]
+        self.script: list[dict] = steps or [{"text": ""}]
+        self.chunk_size = chunk_size
+        self._step = 0
+
+    async def stream_events(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[LLMText | LLMToolCall]:
+        step = self.script[min(self._step, len(self.script) - 1)]
+        self._step += 1
+
+        text = str(step.get("text") or "")
+        for i in range(0, len(text), self.chunk_size):
+            yield LLMText(text[i: i + self.chunk_size])
+
+        for call in step.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            args = call.get("arguments")
+            if not isinstance(args, str):
+                args = json.dumps(args or {}, ensure_ascii=False)
+            yield LLMToolCall(
+                id=str(call.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+                name=str(call.get("name") or ""),
+                arguments=args or "{}",
+            )

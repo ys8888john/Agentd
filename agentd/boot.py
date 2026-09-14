@@ -84,6 +84,8 @@ class Settings:
     openai_model: str
     openai_api_key: str
     fake_reply: str
+    script_file: str           # backend=script：脚本文件路径（与 script_json 二选一）
+    script_json: str           # backend=script：内联脚本 JSON（优先于 script_file）
     system_prompt: str | None
     store_backend: str          # sqlite | memory
     db_path: str
@@ -103,6 +105,8 @@ def load_settings() -> Settings:
         openai_model=_env("AGENTD_OPENAI_MODEL", "qwen3"),
         openai_api_key=_env("AGENTD_OPENAI_API_KEY", "ollama"),
         fake_reply=_env("AGENTD_FAKE_REPLY", "这是 FakeLLM 的固定回复。"),
+        script_file=_env("AGENTD_SCRIPT_FILE", ""),
+        script_json=os.getenv("AGENTD_SCRIPT_JSON", ""),
         system_prompt=os.getenv("AGENTD_SYSTEM_PROMPT") or None,
         store_backend=_env("AGENTD_STORE", "sqlite").lower(),
         db_path=_env("AGENTD_DB_PATH", str(default_db_path())),
@@ -129,6 +133,19 @@ def build_llm(settings: Settings | None = None) -> LLM:
         from .kernel.llm import FakeLLM
 
         return FakeLLM(reply=s.fake_reply)
+    if s.backend == "script":
+        # 回放脚本：端到端验证 MCP 工具循环用，不依赖任何真实模型。
+        from .kernel.llm import ScriptLLM
+
+        if s.script_json.strip():
+            return ScriptLLM(s.script_json)
+        if s.script_file:
+            try:
+                raw = Path(s.script_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(f"读不到脚本文件 {s.script_file}: {exc}") from exc
+            return ScriptLLM(raw)
+        raise ValueError("backend=script 需要 AGENTD_SCRIPT_JSON 或 AGENTD_SCRIPT_FILE")
     raise ValueError(f"未知 LLM 后端: {s.backend}")
 
 

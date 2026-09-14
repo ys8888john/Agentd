@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,6 +138,77 @@ async def test_mcp_hub_bad_server_is_isolated():
     async with McpHub([{"name": "bad", "command": "definitely-not-a-real-cmd-xyz"}]) as hub:
         assert not hub.has_tools
         assert hub.errors  # 失败被记录，但没抛，整轮不崩
+
+
+async def test_mcp_hub_accepts_acp_pydantic_model_config():
+    """回归：ACP SDK 在路由层已把 mcpServers 校验成 pydantic 模型（不是 dict）。
+
+    早先 McpHub 只认 dict，`isinstance(raw, dict)` 为假就把整条静默跳过 ——
+    现象是 agentd 日志说"本会话接入 1 个 MCP server"，却一个工具都列不出来，
+    工具调用回"[错误] 未知工具"。这个用例把这个形态钉死。
+    """
+    from acp.schema import McpServerStdio
+
+    model = McpServerStdio(
+        name="echo", command=sys.executable, args=[_ECHO_SERVER], env=[]
+    )
+    assert not isinstance(model, dict)  # 确保测的确实是"非 dict"这条路径
+
+    async with McpHub([model], cwd=str(Path(__file__).parent)) as hub:
+        assert hub.has_tools, f"pydantic 形态没被识别；errors={hub.errors}"
+        out = await hub.call("echo__echo", '{"text":"模型形态"}')
+        assert out == "echo: 模型形态"
+
+
+async def test_mcp_hub_skips_illegal_config_with_error():
+    """既不是 dict 也不是模型的配置要被记下来（不能静默吞掉）。"""
+    async with McpHub(["oops"]) as hub:
+        assert not hub.has_tools
+        assert hub.errors
+
+
+def test_as_str_map_accepts_model_items():
+    """env/headers 在线上是 EnvVariable 之类的模型，不是 dict。"""
+    from acp.schema import EnvVariable
+
+    from agentd.kernel.mcp import _as_str_map
+
+    assert _as_str_map([EnvVariable(name="A", value="1")]) == {"A": "1"}
+    assert _as_str_map([{"name": "B", "value": "2"}]) == {"B": "2"}
+    assert _as_str_map({"C": "3"}) == {"C": "3"}
+
+
+# ---------------------------------------------------------------------------
+# 4) ScriptLLM：端到端验证用的脚本回放后端
+# ---------------------------------------------------------------------------
+
+async def test_script_llm_replays_tool_calls_then_text():
+    from agentd.kernel.llm import ScriptLLM
+
+    llm = ScriptLLM(
+        [
+            {"tool_calls": [{"name": "echo__echo", "arguments": {"text": "x"}}]},
+            {"text": "完成"},
+        ]
+    )
+    first = [e async for e in llm.stream_events([])]
+    calls = [e for e in first if isinstance(e, LLMToolCall)]
+    assert len(calls) == 1
+    assert calls[0].name == "echo__echo"
+    assert json.loads(calls[0].arguments) == {"text": "x"}  # 对象被转成 JSON 字符串
+
+    second = [e async for e in llm.stream_events([])]
+    assert "".join(e.text for e in second if isinstance(e, LLMText)) == "完成"
+
+
+async def test_script_llm_repeats_last_step_when_exhausted():
+    """脚本用完不抛异常 —— 免得掩盖真正的问题（比如模型不收敛）。"""
+    from agentd.kernel.llm import ScriptLLM
+
+    llm = ScriptLLM([{"text": "只有一步"}])
+    for _ in range(3):
+        events = [e async for e in llm.stream_events([])]
+        assert "".join(e.text for e in events if isinstance(e, LLMText)) == "只有一步"
 
 
 # ---------------------------------------------------------------------------

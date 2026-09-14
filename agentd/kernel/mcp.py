@@ -55,7 +55,33 @@ def _as_str_map(raw: Any) -> dict[str, str]:
     for item in raw or []:
         if isinstance(item, dict) and item.get("name"):
             out[str(item["name"])] = str(item.get("value", ""))
+        else:
+            # ACP SDK 会把它校验成 EnvVariable 之类的模型，不是 dict
+            name = getattr(item, "name", None)
+            if name:
+                out[str(name)] = str(getattr(item, "value", ""))
     return out
+
+
+def _as_config(raw: Any) -> dict | None:
+    """把一条 server 配置折成 str-key 的 dict。
+
+    为什么需要：ACP SDK 在路由层已经把 mcpServers 校验成 pydantic 模型
+    （McpServerStdio / HttpMcpServer ...），传到这里的是**模型对象而不是 dict**。
+    早先只认 dict，导致 `isinstance(raw, dict)` 为假、整条被静默跳过 ——
+    现象就是"agentd 说接入了 1 个 server，但一个工具都列不出来"。
+    """
+    if isinstance(raw, dict):
+        return raw
+    dump = getattr(raw, "model_dump", None)
+    if callable(dump):
+        try:
+            data = dump(by_alias=True)
+        except TypeError:  # 老 pydantic 没有 by_alias
+            data = dump()
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def _result_text(result: Any) -> str:
@@ -97,12 +123,15 @@ class McpHub:
     # ---- 连接 ----
 
     async def _connect_one(self, raw: Any) -> None:
-        if not isinstance(raw, dict):
-            self._errors.append(f"非法 server 配置：{raw!r}")
+        cfg = _as_config(raw)
+        if cfg is None:
+            msg = f"非法 server 配置，已跳过：{raw!r}"
+            _log(f"[agentd] {msg}")
+            self._errors.append(msg)
             return
-        name = str(raw.get("name") or f"server{len(self._sessions)}")
+        name = str(cfg.get("name") or f"server{len(self._sessions)}")
         try:
-            read, write = await self._open_stream(raw)
+            read, write = await self._open_stream(cfg)
         except Exception as exc:  # noqa: BLE001 - 单个 server 挂了不该拖垮整轮
             msg = f"MCP server {name} 连接失败：{type(exc).__name__}: {exc}"
             _log(f"[agentd] {msg}")
