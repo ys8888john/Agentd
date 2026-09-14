@@ -1,10 +1,12 @@
 """原生工具层（kernel/tools.py）测试。
 
-分四块：
-1. 六个工具各自的行为（真文件系统，全在 tmp_path 里）；
+分六块：
+1. 六个本地工具各自的行为（真文件系统，全在 tmp_path 里）；
 2. 路径边界与 profile（能不能越出 cwd、read_only 能不能挡住写）；
 3. needs_approval 的判定矩阵 + AgentMode 的审批/kind 端到端；
-4. ACP 映射：_ACP_KIND 必须覆盖 kernel 产出的每一个 ToolKind（漏一个 = 客户端静默卡死）。
+4. ACP 映射：_ACP_KIND 必须覆盖 kernel 产出的每一个 ToolKind（漏一个 = 客户端静默卡死）；
+5. 内核接线；6. 联网工具的解析 / 编码 / 错误路径（真发 HTTP 的部分在
+tests/test_web_tools_live.py，需要显式开 AGENTD_LIVE_WEB=1）。
 """
 
 from __future__ import annotations
@@ -28,6 +30,11 @@ from agentd.kernel.tools import (
     ApprovalRequest,
     NativeToolbox,
     TOOL_PROFILES,
+    _decode,
+    _html_to_text,
+    _looks_textual,
+    _parse_bing,
+    _unwrap_bing_url,
     needs_approval,
 )
 from agentd.transports.acp_stdio import _ACP_KIND
@@ -778,3 +785,222 @@ async def test_acp_prompt_end_to_end_with_native_tool(tmp_path):
 
     outputs = [getattr(u, "raw_output", None) for _, u in conn.updates]
     assert any(o and "hello.txt" in o for o in outputs)
+
+
+# ---------------------------------------------------------------------------
+# 7) 联网工具（web_search / web_fetch）
+# ---------------------------------------------------------------------------
+# 真正发 HTTP 的那一跳不在这里测 —— 它依赖外网，进 CI 只会随机变红。
+# 这里只测"解析 / 编码 / 错误路径 / 接线"，全是纯函数或本地必然失败的网络地址；
+# 真实的联网验证在 tests/test_web_tools_live.py（要显式开 AGENTD_LIVE_WEB=1）。
+
+
+# 照 Bing 结果页的形状手写的最小样本（b_algo 块 + h2>a + p + sb_count）
+_FAKE_BING_PAGE = """
+<html><body><ol id="b_results">
+<li class="b_algo"><h2><a href="https://a.example/1">第一条 &amp; 标题</a></h2>
+  <p>第一段摘要<br>带换行</p></li>
+<li class="b_algo"><h2><a href="https://b.example/2">第二条</a></h2>
+  <div class="b_caption"><p>第二段摘要</p></div></li>
+<li class="b_algo"><h2><a href="https://c.example/3">第三条</a></h2></li>
+</ol><span class="sb_count">约 1,234 条结果</span></body></html>
+"""
+
+
+def test_parse_bing_extracts_title_url_and_snippet():
+    results, hint = _parse_bing(_FAKE_BING_PAGE, 10)
+    assert [r["title"] for r in results] == ["第一条 & 标题", "第二条", "第三条"]
+    assert [r["url"] for r in results] == [
+        "https://a.example/1",
+        "https://b.example/2",
+        "https://c.example/3",
+    ]
+    # 实体要还原、标签要剥掉、换行要折成空格
+    assert results[0]["snippet"] == "第一段摘要带换行"
+    assert results[1]["snippet"] == "第二段摘要"
+    assert results[2]["snippet"] == ""  # 没有 <p> 就是空摘要，不是 None
+    assert hint == "约 1,234 条结果"
+
+
+def test_parse_bing_honors_limit():
+    assert len(_parse_bing(_FAKE_BING_PAGE, 2)[0]) == 2
+    assert len(_parse_bing(_FAKE_BING_PAGE, 1)[0]) == 1
+
+
+def test_parse_bing_on_empty_or_garbage_page():
+    """解析不出来必须返回空，让上层报错 —— 不能编。"""
+    assert _parse_bing("", 5) == ([], "")
+    assert _parse_bing("<html><body>什么都没有</body></html>", 5) == ([], "")
+
+
+def test_unwrap_bing_redirect_url():
+    """Bing 的 /ck/a?u=a1<base64url> 包装要能还原成目标站。"""
+    import base64
+
+    target = "https://example.com/a/b?x=1&y=2"
+    payload = base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+    wrapped = f"https://www.bing.com/ck/a?u=a1{payload}&ntb=1"
+    assert _unwrap_bing_url(wrapped) == target
+
+
+def test_unwrap_bing_leaves_direct_urls_alone():
+    for url in ("https://example.com/x", "http://a.b/c?d=1"):
+        assert _unwrap_bing_url(url) == url
+
+
+def test_unwrap_bing_bad_payload_returns_original():
+    """解不开就原样返回，绝不能抛异常、更不能安静地解出空串。
+
+    b64 解码会**宽容地**忽略非字母表字符，所以垃圾输入有两种坏法：
+    解成空串（`u=a1!!!!`），或者因为非 ASCII 直接抛 ValueError。
+    两条路都必须退回原值 —— 否则结果里会出现空 URL。
+    """
+    for bad in (
+        "https://www.bing.com/ck/a?u=a1!!!!",
+        "https://www.bing.com/ck/a?u=a1这不是base64!!!",
+        "https://www.bing.com/ck/a",
+    ):
+        assert _unwrap_bing_url(bad) == bad
+    # 解出来不是 URL 的（比如刚好是别的 base64 文本）也要退回原值
+    import base64
+
+    not_a_url = base64.urlsafe_b64encode(b"just some text").decode().rstrip("=")
+    wrapped = f"https://www.bing.com/ck/a?u=a1{not_a_url}"
+    assert _unwrap_bing_url(wrapped) == wrapped
+
+
+def test_html_to_text_strips_script_and_style():
+    page = (
+        "<html><head><style>body{color:red}</style>"
+        "<script>var secret=1;</script></head>"
+        "<body><p>正文</p></body></html>"
+    )
+    text = _html_to_text(page)
+    assert "正文" in text
+    assert "secret" not in text and "color:red" not in text
+
+
+def test_html_to_text_unescapes_and_keeps_block_breaks():
+    text = _html_to_text("<div>a &lt;b&gt;</div><div>c</div>")
+    # 实体必须还原，否则模型读到的是 "a &lt;b&gt;" 而不是 "a <b>"
+    assert "a <b>" in text
+    # 每个块级标签各折成一个换行；相邻的两个块各贡献一个，
+    # 于是两块之间留出一个空行 —— 段落间空一行正是想要的读感。
+    assert text.splitlines() == ["a <b>", "", "c"]
+
+
+def test_html_to_text_collapses_runs_of_blank_lines():
+    text = _html_to_text("<p>a</p><p></p><p></p><p></p><p>b</p>")
+    assert text == "a\n\nb"
+
+
+def test_looks_textual_is_deliberately_lenient():
+    assert _looks_textual("text/html; charset=utf-8")
+    assert _looks_textual("application/json")
+    assert _looks_textual("")  # 没声明就当文本试一次
+    assert _looks_textual("application/octet-stream") is False
+    assert _looks_textual("application/pdf") is False
+
+
+def test_decode_honors_declared_charset_and_falls_back():
+    assert _decode("中文".encode("gbk"), "text/html; charset=gbk") == "中文"
+    # 声明了一个 Python 不认识的编码名，不能炸
+    assert _decode(b"abc", "text/html; charset=no-such-charset") == "abc"
+
+
+def test_web_search_requires_query_without_touching_network():
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_search", json.dumps({"query": "   "})))
+    assert out.startswith("[错误]") and "query" in out
+
+
+def test_web_fetch_rejects_non_http_scheme():
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "ftp://example.com/x"})))
+    assert out.startswith("[错误]") and "http" in out
+    assert asyncio.run(tb.call("web_fetch", "{}")).startswith("[错误]")
+
+
+def _bypass_sandbox_proxy(monkeypatch):
+    """摘掉代理环境变量，让请求直达环回地址。
+
+    本机（以及任何带 HTTP_PROXY 的环境）会把出网流量统统导给本地代理，
+    连 http://127.0.0.1:9 也会被代理成 HTTP 502 —— 那样测到的是
+    "服务器返回错误码"分支，而不是我们想验的 "根本连不上" 分支。
+    清掉代理后内核会立刻拒绝连接（ConnectError），归入 httpx.HTTPError。
+    """
+    for var in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+
+
+def test_web_search_reports_connection_failure(monkeypatch):
+    """连不上时必须回 [错误] 前缀（AgentMode 靠它把卡片标成 failed），而不是抛异常。
+
+    指向 127.0.0.1:9 是刻意的：本地必然立刻拒绝，不产生任何外网流量。
+    """
+    import agentd.kernel.tools as tools_mod
+
+    _bypass_sandbox_proxy(monkeypatch)
+    monkeypatch.setattr(tools_mod, "_SEARCH_ENDPOINT", "http://127.0.0.1:9/search")
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_search", json.dumps({"query": "x"})))
+    assert out.startswith("[错误]") and "联网搜索失败" in out
+
+
+def test_web_fetch_reports_connection_failure(monkeypatch):
+    _bypass_sandbox_proxy(monkeypatch)
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "http://127.0.0.1:9/x"})))
+    assert out.startswith("[错误]") and "抓取" in out
+
+
+def test_search_endpoint_is_overridable_by_env(monkeypatch):
+    """AGENTD_SEARCH_ENDPOINT 能换搜索后端。
+
+    跨仓库联网 e2e（native_tools_e2e.py --scenario web）就是靠它把后端指到
+    本地假 Bing 上，从而离线可复现；顺带也是 cn.bing.com 不通时的逃生门。
+    """
+    import agentd.kernel.tools as tools_mod
+
+    monkeypatch.delenv("AGENTD_SEARCH_ENDPOINT", raising=False)
+    assert tools_mod._search_endpoint() == tools_mod._SEARCH_ENDPOINT
+
+    monkeypatch.setenv("AGENTD_SEARCH_ENDPOINT", "http://127.0.0.1:1234/search")
+    assert tools_mod._search_endpoint() == "http://127.0.0.1:1234/search"
+
+    # 空串当"没设"处理，否则端点会变成空 URL、报一个看不懂的错
+    monkeypatch.setenv("AGENTD_SEARCH_ENDPOINT", "")
+    assert tools_mod._search_endpoint() == tools_mod._SEARCH_ENDPOINT
+
+
+def test_web_tools_are_registered_readonly():
+    """联网工具是只读的：kind 分别是 search / fetch，且不要求审批。"""
+    tb = box(Path.cwd())
+    assert tb.kind_of("web_search") == "search"
+    assert tb.kind_of("web_fetch") == "fetch"
+    assert tb.requires_permission("web_search") is False
+    assert tb.requires_permission("web_fetch") is False
+    # 两个 kind 都必须在 ACP 的合法值里，否则客户端映射会落到 other
+    assert tb.kind_of("web_search") in _ACP_KIND.values()
+    assert tb.kind_of("web_fetch") in _ACP_KIND.values()
+
+
+def test_fetch_kind_is_treated_as_read_only_by_approval():
+    """fetch 也算只读：否则 AGENTD_TOOLS_APPROVE=all 会把"读个网页"也变成一路点允许。"""
+    for policy in ("native", "all", "none"):
+        assert (
+            needs_approval(requires=False, kind="fetch", destructive=False, policy=policy)
+            is False
+        )
+
+
+def test_web_tools_are_absent_from_read_only_profile():
+    """read_only 档刻意不含联网工具：这个档的语义是"纯本地只读"，不带出网。"""
+    names = NativeToolbox(cwd=Path.cwd(), profile="read_only").names
+    assert "web_search" not in names and "web_fetch" not in names
+    assert "web_search" in NativeToolbox(cwd=Path.cwd(), profile="native").names

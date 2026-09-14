@@ -42,6 +42,7 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 | `AGENTD_TOOLS_ALLOW_OUTSIDE` | 允许原生工具访问 cwd 之外的路径 | `false` |
 | `AGENTD_TOOLS_TIMEOUT` | `run_command` 默认超时（秒） | `30` |
 | `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none` | `native` |
+| `AGENTD_SEARCH_ENDPOINT` | `web_search` 的搜索后端地址 | `https://cn.bing.com/search` |
 
 ### `script` 后端：不靠模型也能验工具链
 
@@ -86,6 +87,8 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 | `write_file` | `edit` | **是** | 整体写文件（覆盖），父目录自动创建 |
 | `edit` | `edit` | **是** | 精确字符串替换；`old_string` 不唯一时报错，除非 `replace_all=true` |
 | `run_command` | `execute` | **是** | 在工作目录跑 shell 命令，返回退出码 + stdout/stderr |
+| `web_search` | `search` | 否 | 用 Bing 搜网页，回"标题 + 直链 + 摘要"，`count` 上限 10 |
+| `web_fetch` | `fetch` | 否 | 抓一个 http(s) 页面，剥成纯文本（最多 2MB） |
 
 约束与限额：路径必须落在会话 cwd 内（`..` 会被 `resolve` 展开后再判，
 `AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；单次返回文本上限 64KB；
@@ -96,6 +99,38 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 （见 `mcp.py` 的生命周期说明）。读文件、搜代码这类动作一次对话要用几十次，
 全走 MCP 等于每轮重启一次 node/python。所以「高频、无状态、纯本地」的动作
 放进程内做；MCP 留给「本来就是独立服务」的能力（fetch / git / 数据库 / 厂商托管）。
+
+#### 联网工具（`web_search` / `web_fetch`）
+
+`web_search` 拿一条 query 回"标题 + 直链 + 摘要"列表；`web_fetch` 把一页 HTML 折成
+纯文本（去脚本样式 → 块级标签转换行 → 剥标签 → 解实体）。抓取上限 2MB，非文本
+content-type 直接报错不猜 —— 防一个大页面或一个 PDF 把内存和上下文一起灌爆。
+
+**搜索后端只有 Bing，这是实测筛出来的（2026-09-14），不是偷懒：**
+
+| 后端 | 实测结果 |
+|---|---|
+| DuckDuckGo（`lite.` / `html.`） | 走隧道全是 502 —— 自己验不了的解析器等于埋雷，宁可不写 |
+| 公共 SearXNG 实例 | 同上，被挡 |
+| Baidu | 返回"百度安全验证"反爬页，不是结果页 |
+| **Bing（`cn.bing.com`）** | **通**。中英文都能稳定拿到 10 条，且结果是目标站直链 |
+
+要加后端形状很固定：拉 HTML → 解析成 `{title, url, snippet}`，在 `_parse_bing`
+旁边照写一个即可。地址本身可以用 `AGENTD_SEARCH_ENDPOINT` 换（见配置表）。
+
+**两个已知限制，别指望在代码里修掉：**
+
+- **Bing 查不到东西时不给"无结果"标记**，而是塞一批不相关结果（乱码 query 实测返回
+  一屏"抖音"）。页面上也没有可靠的空结果标志（`b_no` 在有结果的页面上同样出现，
+  是别的用途）。所以不做"无结果"判定，只能靠把 query 写具体；真返回空列表时报的是
+  "没能从结果页解析出条目"，那更可能是被限流 / Bing 换了页面结构，**不是**"查无此词"。
+- **一页只有 10 条，`count` 也封顶在 10。** 实测传 `count=20` 仍只回 10 个
+  `b_algo` 块，所以不做翻页 —— 要更多结果就打几个不同的 query。
+
+**为什么这两个工具不弹审批。** 它们确实会出网，但有两条：一是 `read_file` 早就把本机
+文件内容交给模型了，模型本可以把内容塞进 `web_search` 的 query 带出去 —— 在联网这
+一步拦，拦不住真正的泄漏路径；二是只读动作一弹窗，用户三分钟就学会无脑点"允许"
+（见下面"审批"一节的取舍）。真要防外泄得在模型出口做，不是在这里。
 
 ### 2. MCP 工具（客户端声明，agent 连）
 
@@ -113,8 +148,8 @@ MCP 协议里没有 ACP 的 kind 概念，所以只能从 `annotations` 反推�
 会改变外部状态的动作在**真正执行前**停下来问一次。ACP 侧走
 `session/request_permission`，弹三个选项：允许一次 / 本会话总是允许 / 拒绝。
 
-- **只读动作（`read` / `search`）在任何策略下都不弹。** 每个 `ls` 都弹窗，
-  用户三分钟就学会无脑点"允许"，审批本身也就废了。
+- **只读动作（`read` / `search` / `fetch`）在任何策略下都不弹。** 每个 `ls` 都弹窗，
+  用户三分钟就学会无脑点"允许"，审批本身也就废了。联网工具归在只读这一侧，理由见上面。
 - 选过"本会话总是允许"的工具名会被记住（记忆在传输层，换客户端可以换策略）。
 - 审批通道出错 / 客户端没实现该能力 / 用户关掉弹窗，**一律按拒绝处理**。
   审批这种拿不准的事必须往"拒绝"倒，反过来就是安全漏洞。
@@ -225,6 +260,12 @@ firewall=false
 - **原生工具的路径必须 `resolve()` 之后再判越界。** 直接字符串比较
   `startswith(cwd)` 会放过 `../`，`Path.resolve()` 把 `..` 和符号链接都展开过，
   再 `relative_to(root)` 才是可靠的判据（`test_path_escape_outside_root_is_rejected`）。
+- **搜索必须伪装成浏览器 UA。** 用 `httpx` 的默认 UA 会被 Bing 直接挡掉，而且
+  **不报错** —— 它返回的是一个正常 HTML 页面，只是里面一个 `b_algo` 块都没有，
+  现象是"搜索永远回'没能从结果页解析出条目'，看着像解析器坏了"。UA 在 `_WEB_HEADERS`。
+- **`AGENTD_SEARCH_ENDPOINT` 是调用时读的，不是 import 时。** 所以指到别处立刻生效、
+  不用重启进程（`_search_endpoint()` 每次读一次；写成模块级常量初值就做不到，
+  单测 monkeypatch 也会失效）。跨仓库联网 e2e 就是靠它把后端指向本地假 Bing 的。
 - **ACP 的 `ToolCallStatus` 里没有 `cancelled`。** 只有
   `pending|in_progress|completed|failed`。所以内核里"用户拒绝了这个工具"这个
   状态到了协议层被迫折成 `failed`（见 `_ACP_STATUS`）—— 于是"用户主动拒绝"和
@@ -247,21 +288,55 @@ MCP 工具循环的测试分三层：`AgentMode` 用假 Hub 测循环逻辑、`M
 echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链路的真实验证
 （含前端）在 ForgeAgent-GUI 的 `scripts/mcp_e2e.py`。
 
-原生工具的测试在 `tests/test_native_tools.py`，同样分四层：
+原生工具的测试在 `tests/test_native_tools.py`，分七块：
 
-1. 六个工具各自的行为（真文件系统，全在 `tmp_path` 里）；
+1. 六个**本地**工具各自的行为（真文件系统，全在 `tmp_path` 里）；
 2. 路径边界（`../` 越界、`allow_outside`）与 profile（`read_only` 挡不挡得住写）；
 3. `needs_approval` 判定矩阵 + `AgentMode` 的 kind 映射 / 审批通过 / 审批拒绝 /
    审批通道抛异常；
 4. ACP 映射：`_ACP_KIND` 覆盖所有 kernel kind、`session/request_permission` 的
-   三种应答（允许一次 / 本会话总是允许 / 取消）各自的翻译结果。
+   三种应答（允许一次 / 本会话总是允许 / 取消）各自的翻译结果；
+5. **联网工具**（第七块）：Bing 页面解析（含 `limit` 截断、空页 / 垃圾页）、
+   跳转包装 URL 的解开（解不出、或解出来不像 URL 时退回原值）、HTML → 纯文本
+   （脚本样式剥除、实体还原、连续空行压缩）、charset 判定、参数校验，
+   以及"连不上必须回 `[错误]` 而不是抛异常"。
+
+联网工具另有一套**真出网**的测试，默认跳过、要显式开：
+
+```bash
+AGENTD_LIVE_WEB=1 pytest tests/test_web_tools_live.py -v
+```
+
+它验的是离线套件验不了的那半件事：**Bing 现在的页面结构还认得出来吗**。
+分开的原因很实际 —— 本机网络时通时不通（隧道会拦），把出网断言塞进默认套件
+等于给 CI 埋一个随机红。断言刻意宽松到只认"有结果、链接是 http(s)"，
+不去钉具体条数和具体站点，那样 Bing 一改版就得跟着修测试。
+
+⚠️ 跑联网真测时**别摘 `HTTP_PROXY`** —— 本机出网正好是靠代理隧道走的
+（下面跨仓库 e2e 反过来要摘，因为它只想连本机）。
 
 再往上一层是 `tests/test_acp.py::test_native_tool_over_real_stdio`：起真子进程，
 用 `script` 后端回放"模型要 glob" → 断言工具真执行了、`kind` 是 `search`、
 stdout 上依然只有 JSON-RPC 帧。不依赖 Ollama。
 
-**跨仓库的真实验证**在 ForgeAgent-GUI 的 `scripts/native_tools_e2e.py`：
-它用真 `AcpClient` 拉起真 agentd，回放"读 + 搜（不该弹审批）→ 写（该弹审批）"，
-然后断言只弹了一次审批、`kind` 分别是 `read`/`search`/`edit`、
-允许时文件真的落盘 / 拒绝时文件绝不存在。这一步是唯一能证明**两个仓库
-对审批帧的理解真的一致**的东西 —— 两边各自打自己造的帧，字段名对不上也测不出来。
+**跨仓库的真实验证**在 ForgeAgent-GUI 的 `scripts/native_tools_e2e.py`，
+两个场景都用真 `AcpClient` 拉起真 agentd、用 `script` 后端回放：
+
+```bash
+python scripts/native_tools_e2e.py                    # files：允许写入
+python scripts/native_tools_e2e.py --deny             # files：拒绝写入
+python scripts/native_tools_e2e.py --scenario web     # 联网工具（离线可跑）
+```
+
+- `files`：回放"读 + 搜（不该弹审批）→ 写（该弹审批）"，断言只弹了一次审批、
+  `kind` 分别是 `read`/`search`/`edit`、允许时文件真落盘 / 拒绝时文件绝不存在。
+- `web`：回放 `web_search`（`count=2`）→ `web_fetch`，断言两个都**没弹审批**、
+  `kind` 是 `search`/`fetch`、`count` 真截断了、HTML 真被剥成了纯文本。
+
+  **它不出网**：脚本自己起一个假的搜索/网页后端（真 socket、真 HTML），再用
+  `AGENTD_SEARCH_ENDPOINT` 把 agentd 的搜索后端指过去，所以离线可复现。
+  agentd 子进程会继承 `HTTP_PROXY`（本机把出网全导给本地代理），脚本顺带给它设了
+  `NO_PROXY=127.0.0.1,localhost` —— 少了这一句，连本机假后端也会被代理成 502。
+
+这一步是唯一能证明**两个仓库对审批帧的理解真的一致**的东西 ——
+两边各自打自己造的帧，字段名对不上也测不出来。

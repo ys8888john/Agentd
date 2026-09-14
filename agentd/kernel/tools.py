@@ -1,10 +1,15 @@
-"""原生工具层：跑在 agentd 进程内的文件 / 命令工具。
+"""原生工具层：跑在 agentd 进程内的文件 / 命令 / 联网工具。
 
 为什么不全部交给 MCP？MCP 的 stdio 客户端内部是 anyio task group，**必须与 enter/exit
 同 task**（见 mcp.py 开头的生命周期说明），所以现在每轮 run 都要现开现关一次子进程。
 读文件、搜代码这类动作一次对话里要用几十次，全走 MCP 等于每轮重启一次 node/python，
 代价完全不成比例。所以把「高频、无状态、纯本地」的动作放进进程里做；
-MCP 留给「本来就是独立服务」的能力（fetch / git / 数据库 / 厂商托管）。
+MCP 留给「本来就是独立服务」的能力（数据库 / 厂商托管 / 要 API key 的服务）。
+
+联网检索（web_search / web_fetch）也放在这里，理由更直接：本机能用的搜索后端只有
+Bing，而 MCP 生态里现成的搜索 server 要么是 Node 实现（本机 npx 被沙箱拦死）、
+要么要 API key、要么走被墙的 DuckDuckGo —— 都不是「装一个包就能用」。
+自己用 httpx + 正则做，零依赖、零配置。详见下面「联网工具」一节。
 
 对外契约与 MCP 工具**完全一致**：tool_schema() 吐 OpenAI 形状的 tools 数组，
 call(name, arguments) -> str，失败文本以 `[错误] ` 开头（沿用 McpHub 的约定，
@@ -18,20 +23,25 @@ AgentMode 靠这个前缀决定 ToolCallDone.status）。
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import fnmatch
+import html
 import json
 import os
 import re
 import sys
+import urllib.parse
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-# ACP ToolKind 的子集：原生工具只用到这几个（其余 delete/move/think/fetch/switch_mode
-# 留给以后，声明了也没工具用得上）。
-Kind = Literal["read", "edit", "search", "execute", "other"]
+import httpx
+
+# ACP ToolKind 的子集：原生工具只用到这几个
+# （其余 delete/move/think/switch_mode 留给以后，声明了也没工具用得上）。
+Kind = Literal["read", "edit", "search", "execute", "fetch", "other"]
 
 ERROR_PREFIX = "[错误] "
 
@@ -201,7 +211,267 @@ _OUT_OF_ROOT = "路径越界：{raw} 不在工作目录 {root} 内（要放开�
 
 
 # ---------------------------------------------------------------------------
-# 六个工具
+# 联网工具（web_search / web_fetch）
+# ---------------------------------------------------------------------------
+
+# 搜索引擎只有一个后端：Bing。**这不是偷懒，是实测筛出来的**（2026-09-14）：
+#   - DuckDuckGo（lite. / html.duckduckgo.com）：走隧道全是 502，验不了 ——
+#     写一个自己验不了的解析器等于埋雷，所以宁可不写；
+#   - 公共 SearXNG 实例：同样被挡；
+#   - Baidu：返回"百度安全验证"反爬页，不是结果页；
+#   - Bing（cn.bing.com / www.bing.com）：通，中英文都能稳定拿到 10 条，
+#     而且结果是目标站**直链**（不用解跳转包装）。
+# 要加后端的话形状很固定：拉 HTML → 解析成 {title, url, snippet}，
+# 在 _parse_bing 旁边照写一个就行。
+_SEARCH_ENDPOINT = "https://cn.bing.com/search"
+
+
+def _search_endpoint() -> str:
+    """搜索后端地址，**每次调用时**读一次，好让它能被覆盖。
+
+    AGENTD_SEARCH_ENDPOINT 的用处有两个，都是实的：
+      - 联网链路的端到端验证指向本地假后端，从而离线、可复现（见 ForgeAgent-GUI
+        的 scripts/native_tools_e2e.py --scenario web）；
+      - cn.bing.com 在有些网络里不通，换个镜像不用改代码。
+    """
+    return os.getenv("AGENTD_SEARCH_ENDPOINT") or _SEARCH_ENDPOINT
+
+# 必须伪装成浏览器：默认 UA（httpx/urllib）会被 Bing 直接挡掉。
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_WEB_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+# 联网单独一套超时：read 给得比 connect 长，搜索/抓取本来就可能慢。
+_WEB_TIMEOUT = httpx.Timeout(connect=6.0, read=20.0, write=10.0, pool=6.0)
+
+# Bing 一页固定回 10 条 —— 实测 count 传 20 也只回 10 个 b_algo 块。
+# 所以不做翻页，count 直接按 10 封顶；要更多结果就打几个不同的 query。
+_MAX_SEARCH_RESULTS = 10
+
+# web_fetch 最多读这么多 HTML：防一个巨大页面把内存和上下文一起灌爆。
+_MAX_HTML_BYTES = 2 * 1024 * 1024
+
+_COMMENT_RX = re.compile(r"<!--.*?-->", re.S)
+# script/style 里的内容全是代码，不剥掉会污染正文
+_SCRIPT_RX = re.compile(r"<(script|style|noscript|template)\b.*?</\1\s*>", re.S | re.I)
+# 块级标签折成换行，否则整页会挤成一行
+_BLOCK_RX = re.compile(
+    r"</?(?:p|div|br|li|ul|ol|tr|td|th|table|h[1-6]|section|article|header|footer"
+    r"|blockquote|pre|form|nav|aside|main)\b[^>]*>",
+    re.I,
+)
+_TAG_RX = re.compile(r"<[^>]+>")
+
+# Bing 结果页的形状（实测）：结果都在 `<li class="b_algo">` 块里，
+# 标题+链接是块内第一个 h2>a，摘要是块内第一个 <p>。
+_BING_BLOCK_SPLIT = re.compile(r'<li class="b_algo"')
+_BING_ANCHOR_RX = re.compile(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_BING_SNIPPET_RX = re.compile(r"<p[^>]*>(.*?)</p>", re.S)
+_BING_COUNT_RX = re.compile(r'<span class="sb_count"[^>]*>(.*?)</span>', re.S)
+
+# content-type 里出现这些片段就当作"能当文本看"
+_TEXTUAL_HINTS = ("text/", "json", "xml", "javascript", "x-www-form-urlencoded")
+
+
+def _text_of(fragment: str) -> str:
+    """剥标签 + 还原实体，并折成单行。"""
+    return " ".join(html.unescape(_TAG_RX.sub("", fragment)).split())
+
+
+def _looks_textual(content_type: str) -> bool:
+    """content-type 看起来是不是文本。
+
+    匹配刻意宽松：不少站点把 HTML 标成 application/octet-stream，
+    宁可多试一次，也别因为一个 header 就把整页内容判死。
+    """
+    lowered = (content_type or "").lower()
+    if not lowered:
+        return True  # 没声明就当文本试一次
+    return any(hint in lowered for hint in _TEXTUAL_HINTS)
+
+
+def _decode(body: bytes, content_type: str) -> str:
+    """按 content-type 里声明的 charset 解码，没写就按 utf-8 兜底。"""
+    lowered = (content_type or "").lower()
+    charset = ""
+    if "charset=" in lowered:
+        charset = lowered.split("charset=", 1)[1].split(";")[0].strip().strip("\"'")
+    try:
+        return body.decode(charset or "utf-8", "replace")
+    except LookupError:  # 声明了一个 Python 不认识的编码名
+        return body.decode("utf-8", "replace")
+
+
+def _unwrap_bing_url(url: str) -> str:
+    """Bing 偶尔把结果包成 `https://www.bing.com/ck/a?...&u=a1<base64url>`。
+
+    实测抓到的那十条都是目标站直链，但结果里混进包装链接是老问题
+    （官网/首页卡片尤其容易），所以顺手解开；解不开就原样返回。
+    """
+    if "bing.com/ck/a" not in url:
+        return url
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    raw = (params.get("u") or [""])[0]
+    if not raw:
+        return url
+    if raw.startswith("a1"):  # a1 是"原始 URL"的前缀标记
+        raw = raw[2:]
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode("utf-8", "replace")
+    except ValueError:  # binascii.Error 是 ValueError 的子类；非 ASCII 也会走这里
+        return url
+    # 只在解出来的东西确实像个 URL 时才采用 —— b64 解码会「宽容地」忽略非法字符，
+    # 于是垃圾输入会安静地解成空串或乱码，那种情况必须退回原值。
+    return decoded if decoded.startswith(("http://", "https://")) else url
+
+
+def _parse_bing(page: str, limit: int) -> tuple[list[dict], str]:
+    """解析 Bing 结果页，返回 (结果列表, 结果条数提示)。
+
+    ⚠️ 已知限制：**Bing 查不到东西时不给"无结果"标记**，而是塞一批不相关结果
+    （实测乱码 query 返回了一屏"抖音"）；页面上也没有可靠的空结果标志
+    （`b_no` 在有结果的页面上同样出现，是别的用途）。所以这里不做"无结果"判定，
+    只能靠把 query 写具体。这条已写进 README，别指望在这里修。
+    """
+    results: list[dict] = []
+    for block in _BING_BLOCK_SPLIT.split(page)[1:]:
+        anchor = _BING_ANCHOR_RX.search(block)
+        if anchor is None:
+            continue
+        title = _text_of(anchor.group(2))
+        url = _unwrap_bing_url(anchor.group(1))
+        if not title or not url:
+            continue
+        snippet = _BING_SNIPPET_RX.search(block)
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": _text_of(snippet.group(1)) if snippet else "",
+            }
+        )
+        if len(results) >= limit:
+            break
+    count_hit = _BING_COUNT_RX.search(page)
+    return results, _text_of(count_hit.group(1)) if count_hit else ""
+
+
+def _html_to_text(raw: str) -> str:
+    """把 HTML 折成可读纯文本。
+
+    刻意不引 bs4 / lxml —— agentd 的依赖表不该为这一个功能多一项，而这种粗提取
+    （去脚本样式 → 块级标签转换行 → 剥标签 → 解实体）用正则够用。
+    代价是表格和复杂排版会走形；在"喂给模型读"的场景里无所谓。
+    """
+    text = _COMMENT_RX.sub("", raw)
+    text = _SCRIPT_RX.sub(" ", text)
+    text = _BLOCK_RX.sub("\n", text)
+    text = _TAG_RX.sub("", text)
+    text = html.unescape(text)
+    lines: list[str] = []
+    blanks = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            blanks += 1
+            if blanks > 1:  # 连续空行压成一个
+                continue
+        else:
+            blanks = 0
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+async def _web_search(args: dict, rt: ToolRuntime) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return err("web_search 缺少 query 参数")
+    limit = min(max(_as_int(args.get("count"), 5), 1), _MAX_SEARCH_RESULTS)
+
+    try:
+        async with httpx.AsyncClient(
+            headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
+        ) as client:
+            resp = await client.get(
+                _search_endpoint(),
+                params={"q": query, "count": str(limit), "setlang": "zh-CN"},
+            )
+            resp.raise_for_status()
+            page = resp.text
+    except httpx.HTTPStatusError as exc:
+        return err(f"搜索引擎返回 HTTP {exc.response.status_code}（多半被限流，稍后再试）")
+    except httpx.HTTPError as exc:
+        return err(f"联网搜索失败：{type(exc).__name__}: {exc}")
+
+    results, count_hint = _parse_bing(page, limit)
+    if not results:
+        return err(
+            f"没能从结果页解析出条目（query={query!r}，页面 {len(page)} 字符）。"
+            "可能是被限流，或者 Bing 换了页面结构。"
+        )
+    head = f"「{query}」搜索到 {len(results)} 条"
+    if count_hint:
+        head += f"（{count_hint}）"
+    lines = [head]
+    for i, item in enumerate(results, 1):
+        lines.append(f"{i}. {item['title']}\n   {item['url']}")
+        if item["snippet"]:
+            lines.append(f"   {item['snippet']}")
+    lines.append("要看正文可以用 web_fetch 打开上面的链接。")
+    return _clip("\n".join(lines), rt.max_bytes, what="搜索结果")
+
+
+async def _web_fetch(args: dict, rt: ToolRuntime) -> str:
+    raw = str(args.get("url") or "").strip()
+    if not raw:
+        return err("web_fetch 缺少 url 参数")
+    if not raw.lower().startswith(("http://", "https://")):
+        return err(f"只支持 http/https 的 URL，收到：{raw[:100]}")
+
+    limit = min(max(_as_int(args.get("max_bytes"), rt.max_bytes) or rt.max_bytes, 500), _MAX_HTML_BYTES)
+
+    try:
+        async with httpx.AsyncClient(
+            headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
+        ) as client:
+            async with client.stream("GET", raw) as resp:
+                resp.raise_for_status()
+                status = resp.status_code
+                ctype = resp.headers.get("content-type", "")
+                final_url = str(resp.url)
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in resp.aiter_bytes():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= _MAX_HTML_BYTES:  # 到顶就停，别把超大页面读进内存
+                        break
+                body = b"".join(chunks)
+    except httpx.HTTPStatusError as exc:
+        return err(f"{raw} 返回 HTTP {exc.response.status_code}")
+    except httpx.HTTPError as exc:
+        return err(f"抓取 {raw} 失败：{type(exc).__name__}: {exc}")
+
+    if not _looks_textual(ctype):
+        return err(
+            f"{final_url} 不是文本内容（content-type: {ctype or '未知'}，{len(body)} 字节）"
+        )
+
+    text = _html_to_text(_decode(body, ctype))
+    if not text:
+        return err(f"{final_url} 抓回 {len(body)} 字节，但剥掉标签后没有正文")
+    head = f"{final_url}（HTTP {status}，{ctype or '未知类型'}，{len(body)} 字节）"
+    return _clip(head + "\n\n" + text, limit, what="网页正文")
+
+
+# ---------------------------------------------------------------------------
+# 八个工具
 # ---------------------------------------------------------------------------
 
 
@@ -536,6 +806,42 @@ _SPECS: tuple[NativeTool, ...] = (
         kind="execute",
         requires_permission=True,
     ),
+    NativeTool(
+        name="web_search",
+        description=(
+            "联网搜索（Bing），返回若干条【标题 / 链接 / 摘要】。"
+            "query 尽量具体（中英文都可以）；摘要不够就看正文，用 web_fetch 打开链接。"
+            "注意：查不到匹配内容时，Bing 会返回一批不相关的结果，而不是报「没有结果」。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索词，越具体越好"},
+                "count": {"type": "integer", "description": "返回几条，默认 5，最多 10"},
+            },
+            "required": ["query"],
+        },
+        handler=_web_search,
+        kind="search",
+    ),
+    NativeTool(
+        name="web_fetch",
+        description=(
+            "抓取一个网页并转成纯文本（自动剥掉 HTML 标签、脚本、样式）。"
+            "适合读文档、README、博客正文。"
+            "注意：不执行 JavaScript，纯前端渲染的页面可能抓不到内容。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "完整 URL，必须以 http:// 或 https:// 开头"},
+                "max_bytes": {"type": "integer", "description": "返回正文的字符上限，默认跟工具限额一致"},
+            },
+            "required": ["url"],
+        },
+        handler=_web_fetch,
+        kind="fetch",
+    ),
 )
 
 ALL_TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in _SPECS)
@@ -560,14 +866,19 @@ def needs_approval(*, requires: bool, kind: str, destructive: bool, policy: str)
       （MCP 协议没有 kind 概念，能拿到的信号只有 annotations 里那几个 hint，
        所以对 MCP 只信它自己声明的 destructive，不替它猜）
 
-    只读动作（read / search）在任何策略下都不弹 —— 每个 ls 都弹窗，用户三分钟就会
-    学会无脑点"允许"，审批本身也就废了。
+    只读动作（read / search / fetch）在任何策略下都不弹 —— 每个 ls 都弹窗，用户三分钟
+    就会学会无脑点"允许"，审批本身也就废了。
+
+    联网工具（web_search / web_fetch）刻意也归到"不弹"这一档，尽管它们能把数据送出
+    本机。理由：`read_file` 读到的内容本来就会进 LLM 的请求体，**出网通道早就存在**，
+    再对搜索/抓取加审批拦不住什么，只会让"查个文档"变成一路点允许。
+    真正需要把住的闸门是「改文件 / 执行命令」——那两个仍然是 must-approve。
     """
     if policy not in POLICIES:
         policy = "native"
     if policy == "none":
         return False
-    if kind in ("read", "search"):
+    if kind in ("read", "search", "fetch"):
         return False
     if policy == "all":
         return True
