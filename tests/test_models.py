@@ -59,7 +59,47 @@ def test_name_rejects_non_str_non_none():
 def test_model_dump_openai_shape():
     m = Message(role="user", content="hi")
     dumped = m.model_dump()
-    assert dumped == {"role": "user", "content": "hi", "name": None}
+    assert dumped == {
+        "role": "user",
+        "content": "hi",
+        "name": None,
+        "tool_calls": None,
+        "tool_call_id": None,
+    }
+
+
+# 工具调用字段（tool_calls / tool_call_id）
+
+def test_message_defaults_no_tool_fields():
+    m = Message(role="assistant", content="x")
+    assert m.tool_calls is None
+    assert m.tool_call_id is None
+
+
+def test_assistant_carries_tool_calls():
+    from agentd.kernel.models import ToolCall
+
+    tc = ToolCall(id="call_1", name="echo", arguments='{"text":"hi"}')
+    m = Message(role="assistant", content="", tool_calls=[tc])
+    assert m.tool_calls[0].name == "echo"
+    assert m.tool_calls[0].arguments == '{"text":"hi"}'
+
+
+def test_tool_factory_sets_call_id():
+    m = Message.tool("结果", tool_call_id="call_1", name="echo")
+    assert m.role == "tool"
+    assert m.content == "结果"
+    assert m.tool_call_id == "call_1"
+    assert m.name == "echo"
+
+
+def test_roundtrip_tool_calls_via_json():
+    from agentd.kernel.models import ToolCall
+
+    m = Message(role="assistant", content="", tool_calls=[ToolCall(id="c1", name="t", arguments="{}")])
+    m2 = Message.model_validate_json(m.model_dump_json())
+    assert m2.tool_calls is not None
+    assert m2.tool_calls[0].id == "c1"
 
 
 def test_exclude_none_drops_name_field():

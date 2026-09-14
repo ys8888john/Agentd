@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..contracts import (
     Done,
@@ -19,7 +20,7 @@ from ..contracts import (
 )
 from .llm import LLM
 from .models import Message
-from .modes import Mode, ModeContext, SingleMode
+from .modes import AgentMode, Mode, ModeContext, SingleMode
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 
 class UnknownModeError(KeyError):
@@ -35,7 +36,10 @@ class AgentKernel:
     def __post_init__(self) -> None:
         self._modes: dict[str, Mode] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # 每个会话的额外配置（cwd / mcp_servers），由 create_session 记下
+        self._session_opts: dict[str, dict[str, Any]] = {}
         self.register(SingleMode())
+        self.register(AgentMode())
 
     def register(self, mode: Mode) -> None:
         if not mode.name:
@@ -51,9 +55,16 @@ class AgentKernel:
         except KeyError as exc:
             raise UnknownModeError(name) from exc
 
-    async def create_session(self) -> str:
+    async def create_session(
+        self, *, cwd: str | None = None, mcp_servers: list[Any] | None = None
+    ) -> str:
         session_id = new_session_id()
         await self.store.create(session_id)
+        # 记住本会话的工作目录与 MCP server 配置，handle() 时交给模式使用
+        self._session_opts[session_id] = {
+            "cwd": cwd,
+            "mcp_servers": list(mcp_servers or []),
+        }
         return session_id
 
     async def history(self, session_id: str) -> list[Message]:
@@ -94,12 +105,15 @@ class AgentKernel:
             await self.store.append(session_id, Message.user(user_input))
             history = await self.store.history(session_id)
 
+            opts = self._session_opts.get(session_id, {})
             ctx = ModeContext(
                 session_id=session_id,
                 run_id=run_id,
                 llm=self.llm,
                 history=history,
                 system=self.system,
+                mcp_servers=opts.get("mcp_servers", []),
+                cwd=opts.get("cwd"),
             )
 
             try:

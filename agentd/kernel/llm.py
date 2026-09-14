@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -37,27 +39,96 @@ class LLMError(RuntimeError):
     """LLM 调用失败（网络/协议/模型错误）统一成这个异常。"""
 
 
-class LLM:
-    """内核只认这个接口。子类实现 stream()，complete() 有默认实现基于 stream 拼接。"""
+@dataclass
+class LLMText:
+    """流式文本增量。"""
 
-    async def stream(self, message: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+    text: str
+
+
+@dataclass
+class LLMToolCall:
+    """模型发起的一次工具调用（arguments 是 JSON 字符串）。"""
+
+    id: str
+    name: str
+    arguments: str = "{}"
+
+
+class LLM:
+    """内核只认这个接口。
+
+    子类实现 `stream_events()`（可同时产出文本增量和工具调用）；`stream()` 是只取
+    文本的便捷封装，老调用方（TUI / single 模式 / 测试）的用法和返回值都不变。
+    """
+
+    async def stream_events(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[LLMText | LLMToolCall]:
         raise NotImplementedError
 
-    async def complete(self, message: list[Message], *, system: str | None = None) -> str:
+    async def stream(self, messages: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+        async for event in self.stream_events(messages, system=system):
+            if isinstance(event, LLMText) and event.text:
+                yield event.text
+
+    async def complete(self, messages: list[Message], *, system: str | None = None) -> str:
         parts: list[str] = []
-        async for chunk in self.stream(message, system=system):
+        async for chunk in self.stream(messages, system=system):
             parts.append(chunk)
         return "".join(parts)
 
 
-def _with_system(messages: list[Message], system: str | None) -> list[dict]:
-    """把 system 塞到最前；剔除 tool 消息里 name=None，避免发给 OpenAI 出现 "name": null。"""
+def _as_args_obj(arguments: str) -> Any:
+    """把 arguments JSON 字符串还原成对象（Ollama 原生端点要对象，不要字符串）。"""
+    try:
+        return json.loads(arguments) if arguments else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _with_system(messages: list[Message], system: str | None, *, ollama: bool = False) -> list[dict]:
+    """把 system 塞到最前，并按线格式序列化工具相关字段。
+
+    - 默认（OpenAI 兼容）：assistant 带 tool_calls（id/type/function，arguments 为 JSON 字符串）；
+      role="tool" 带 tool_call_id。
+    - ollama=True：tool_calls 的 arguments 还原成对象、不带 id/type；工具结果用 tool_name。
+    - name=None 一律不写，避免出现 "name": null。
+    """
     out: list[dict] = []
     if system:
         out.append({"role": "system", "content": system})
     for m in messages:
         item: dict[str, Any] = {"role": m.role, "content": m.content}
-        if m.name is not None:
+        if m.role == "assistant" and m.tool_calls:
+            if ollama:
+                item["tool_calls"] = [
+                    {"function": {"name": tc.name, "arguments": _as_args_obj(tc.arguments)}}
+                    for tc in m.tool_calls
+                ]
+            else:
+                item["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments},
+                    }
+                    for tc in m.tool_calls
+                ]
+        if m.role == "tool":
+            if ollama:
+                if m.name:
+                    item["tool_name"] = m.name
+            else:
+                if m.tool_call_id:
+                    item["tool_call_id"] = m.tool_call_id
+                if m.name:
+                    item["name"] = m.name
+        elif m.name is not None:
             item["name"] = m.name
         out.append(item)
     return out
@@ -174,27 +245,39 @@ class OllamaNativeLLM(LLM):
         return self._resolved
 
     def _payload(
-        self, messages: list[Message], system: str | None, model: str | None = None
+        self,
+        messages: list[Message],
+        system: str | None,
+        model: str | None = None,
+        tools: list[dict] | None = None,
     ) -> dict:
         body = {
             "model": model or self.model,
-            "messages": _with_system(messages, system),
+            "messages": _with_system(messages, system, ollama=True),
             "stream": True,
             "think": self.think,
         }
         # think 是 Ollama 原生参数；闭源模型没有就忽略即可
         if self.options:
             body["options"] = self.options
+        if tools:
+            body["tools"] = tools
         return body
 
-    async def stream(self, messages: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+    async def stream_events(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[LLMText | LLMToolCall]:
         model = await self.resolve_model()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                 async with client.stream(
                     "POST",
                     f"{self.host}/api/chat",
-                    json=self._payload(messages, system, model),
+                    json=self._payload(messages, system, model, tools),
                 ) as resp:
                     # Ollama 出错时 HTTP 状态码仍是 200，错误藏在 body 里，得读出来判断；
                     # 但 4xx/5xx（比如模型不存在返回 404）是例外，body 里那句
@@ -211,9 +294,21 @@ class OllamaNativeLLM(LLM):
                         obj = json.loads(line)
                         if obj.get("error"):
                             raise LLMError(str(obj["error"]))
-                        text = (obj.get("message") or {}).get("content") or ""
+                        msg = obj.get("message") or {}
+                        text = msg.get("content") or ""
                         if text:
-                            yield text
+                            yield LLMText(text)
+                        # Ollama 原生 tool_calls 只给 function.name / function.arguments（对象），
+                        # 没有 id —— 我们自己补一个，好让 start/done 能配对。
+                        for call in msg.get("tool_calls") or []:
+                            fn = call.get("function") or {}
+                            args = fn.get("arguments")
+                            args_str = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+                            yield LLMToolCall(
+                                id=f"call_{uuid.uuid4().hex[:12]}",
+                                name=fn.get("name") or "",
+                                arguments=args_str or "{}",
+                            )
                         if obj.get("done"):
                             return
         except httpx.ConnectError as exc:
@@ -258,23 +353,39 @@ class OpenAICompatLLM(LLM):
         return self._resolved
 
     def _payload(
-        self, messages: list[Message], system: str | None, model: str | None = None
+        self,
+        messages: list[Message],
+        system: str | None,
+        model: str | None = None,
+        tools: list[dict] | None = None,
     ) -> dict:
-        return {
+        body = {
             "model": model or self.model,
             "messages": _with_system(messages, system),
             "stream": True,
         }
+        if tools:
+            body["tools"] = tools
+        return body
 
-    async def stream(self, messages: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+    async def stream_events(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[LLMText | LLMToolCall]:
         model = await self.resolve_model()
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        # 工具调用在 SSE 里按 index **增量拼接**：先来 id/name，arguments 分片渐次到达。
+        # 用一个 dict 累积，流结束时再一次性吐出去（见函数末尾）。
+        pending: dict[int, dict[str, str]] = {}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                 async with client.stream(
                     "POST",
                     f"{self.base_url}/chat/completions",
-                    json=self._payload(messages, system, model),
+                    json=self._payload(messages, system, model, tools),
                     headers=headers,
                 ) as resp:
                     if resp.status_code >= 400:
@@ -289,18 +400,36 @@ class OpenAICompatLLM(LLM):
                             continue
                         data = line[len("data:"):].strip()
                         if data == "[DONE]":
-                            return
+                            break
                         obj = json.loads(data)
                         if obj.get("error"):
                             raise LLMError(str(obj["error"]))
                         delta = (obj.get("choices") or [{}])[0].get("delta") or {}
                         text = delta.get("content") or ""
                         if text:
-                            yield text
+                            yield LLMText(text)
+                        for call in delta.get("tool_calls") or []:
+                            idx = call.get("index", 0)
+                            slot = pending.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                            if call.get("id"):
+                                slot["id"] = call["id"]
+                            fn = call.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["arguments"] += fn["arguments"]
         except httpx.ConnectError as exc:
             raise LLMError(f"连不上 {self.base_url}：{exc}") from exc
         except httpx.TimeoutException as exc:
             raise LLMError(f"OpenAI 兼容端点请求超时：{exc}") from exc
+
+        for idx in sorted(pending):
+            slot = pending[idx]
+            yield LLMToolCall(
+                id=slot["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                name=slot["name"],
+                arguments=slot["arguments"] or "{}",
+            )
 
 
 class FakeLLM(LLM):
@@ -310,7 +439,13 @@ class FakeLLM(LLM):
         self.reply = reply
         self.chunk_size = chunk_size
 
-    async def stream(self, messages: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+    async def stream_events(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[LLMText | LLMToolCall]:
         text = self.reply
         for i in range(0, len(text), self.chunk_size):
-            yield text[i: i + self.chunk_size]
+            yield LLMText(text[i: i + self.chunk_size])

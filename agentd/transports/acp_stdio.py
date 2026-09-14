@@ -20,11 +20,20 @@ from acp import (
     InitializeResponse,
     NewSessionResponse,
     PromptResponse,
+    start_tool_call,
     update_agent_message_text,
     update_agent_thought_text,
+    update_tool_call,
 )
 
-from ..contracts import Done, ErrorEvent, MessageDelta, MessageDone
+from ..contracts import (
+    Done,
+    ErrorEvent,
+    MessageDelta,
+    MessageDone,
+    ToolCallDone,
+    ToolCallStart,
+)
 from ..kernel.kernel import AgentKernel
 
 # ACP 的 stop_reason 取值是固定的五种，其中没有 "error"：
@@ -36,6 +45,12 @@ _STOP_REASON_MAP = {
     # 执行出错：错误内容已经通过 thought 通道告知客户端，这里按正常收尾
     "error": "end_turn",
 }
+
+# 内核的 kind/status 取值与 ACP schema 不完全重合，映射一下才合法：
+#   ACP ToolKind   = read|edit|delete|move|search|execute|think|fetch|switch_mode|other
+#   ACP ToolStatus = pending|in_progress|completed|failed
+_ACP_KIND = {"read": "read", "edit": "edit", "execute": "execute", "generic": "other"}
+_ACP_STATUS = {"completed": "completed", "failed": "failed", "cancelled": "failed"}
 
 
 class AgentdAcpAgent(Agent):
@@ -92,10 +107,10 @@ class AgentdAcpAgent(Agent):
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        session_id = await self._kernel.create_session()
+        session_id = await self._kernel.create_session(cwd=cwd, mcp_servers=mcp_servers)
         self._log(f"[agentd] 新会话 {session_id}  cwd={cwd}")
         if mcp_servers:
-            self._log(f"[agentd] 收到 {len(mcp_servers)} 个 MCP server，暂未接入")
+            self._log(f"[agentd] 本会话接入 {len(mcp_servers)} 个 MCP server")
         # modes / config_options 也在这里声明 —— 等 C 方案落地时填上
         return NewSessionResponse(session_id=session_id)
 
@@ -115,7 +130,8 @@ class AgentdAcpAgent(Agent):
         self, session_id: str, prompt: list[Any], **kwargs: Any
     ) -> PromptResponse:
         text = self._extract_text(prompt)
-        mode = self._session_modes.get(session_id, "single")
+        # 默认走 agent 模式（无工具时与 single 等价，有 MCP server 时才会触发工具循环）
+        mode = self._session_modes.get(session_id, "agent")
 
         # 先校验：这里抛出的异常会被 SDK 转成 JSON-RPC error，
         # 比开流之后再失败干净得多。
@@ -142,11 +158,31 @@ class AgentdAcpAgent(Agent):
                     session_id, update_agent_thought_text(f"[错误] {event.message}")
                 )
 
+            elif isinstance(event, ToolCallStart):
+                await self._conn.session_update(
+                    session_id,
+                    start_tool_call(
+                        event.call_id,
+                        event.title,
+                        kind=_ACP_KIND.get(event.kind, "other"),
+                        status="in_progress",
+                    ),
+                )
+
+            elif isinstance(event, ToolCallDone):
+                await self._conn.session_update(
+                    session_id,
+                    update_tool_call(
+                        event.call_id,
+                        status=_ACP_STATUS.get(event.status, "completed"),
+                        raw_output=event.output,
+                    ),
+                )
+
             elif isinstance(event, Done):
                 stop_reason = _STOP_REASON_MAP.get(event.stop_reason, "end_turn")
 
             else:
-                # 工具调用类事件还没映射 —— 现在没有任何模式产出它们
                 self._log(f"[agentd] 暂未映射的事件类型: {event.type}")
 
         return PromptResponse(stop_reason=stop_reason)

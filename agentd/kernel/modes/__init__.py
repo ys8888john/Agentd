@@ -3,7 +3,8 @@
 每种模式就是一个 AsyncIterator[Event] 的生成器，不关心谁在消费它。
 """
 
+from .agent import AgentMode
 from .base import Mode, ModeContext
 from .single import SingleMode
 
-__all__ = ["Mode", "ModeContext", "SingleMode"]
+__all__ = ["Mode", "ModeContext", "SingleMode", "AgentMode"]
