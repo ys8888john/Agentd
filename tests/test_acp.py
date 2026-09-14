@@ -61,8 +61,19 @@ class _Proc:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
 
-    async def start(self) -> asyncio.subprocess.Process:
-        env = dict(os.environ, AGENTD_LLM_BACKEND="fake", AGENTD_FAKE_REPLY=REPLY)
+    async def start(self, **env_extra: str) -> asyncio.subprocess.Process:
+        """起一个 agentd 子进程；env_extra 用来换后端（script 后端验工具链时用）。
+
+        默认塞 AGENTD_DOTENV=__nonexistent__，免得仓库里某天多出一个 .env
+        就把整份 ACP 测试的行为悄悄改掉。
+        """
+        env = dict(
+            os.environ,
+            AGENTD_DOTENV="__nonexistent__",
+            AGENTD_LLM_BACKEND="fake",
+            AGENTD_FAKE_REPLY=REPLY,
+        )
+        env.update(env_extra)  # 用 update 而不是 ** 展开：env_extra 要能覆盖上面的默认值
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "agentd.server",
             cwd=PROJECT_ROOT,
@@ -160,3 +171,63 @@ async def test_unknown_session_is_reported_as_error(agent: _Proc):
     )
     # 内核抛 UnknownSessionError，SDK 应当转成 JSON-RPC error，而不是静默成功
     assert "error" in resp, resp
+
+
+def _updates(notifications: list[dict]) -> list[dict]:
+    """从 session/update 通知里把 update 载荷拆出来（形状不对的直接跳过）。"""
+    out: list[dict] = []
+    for n in notifications:
+        upd = ((n.get("params") or {}).get("update") or {})
+        if isinstance(upd, dict):
+            out.append(upd)
+    return out
+
+
+async def test_native_tool_over_real_stdio(tmp_path: Path):
+    """原生工具（glob）走真子进程 —— 这条钉三件事：
+
+    1. stdout 上依然只有 JSON-RPC（工具结果再长也没污染帧）；
+    2. 工具 start 通知里的 kind 是 ACP 合法值，且**按工具映射**（glob ⇒ search，
+       而不是以前写死的 execute）；
+    3. 工具真正执行了，输出里有目标文件。
+
+    LLM 侧用 script 后端回放，所以不依赖 Ollama，CI 里也能跑。
+    """
+    (tmp_path / "hello.txt").write_text("hi", encoding="utf-8")
+    script = json.dumps(
+        [
+            {"tool_calls": [{"name": "glob", "arguments": {"pattern": "*.txt"}}]},
+            {"text": "找到 1 个文件"},
+        ]
+    )
+
+    p = _Proc()
+    await p.start(
+        AGENTD_LLM_BACKEND="script",
+        AGENTD_SCRIPT_JSON=script,
+        AGENTD_STORE="memory",
+    )
+    try:
+        await p.call(1, _method("initialize"), {"protocolVersion": PROTOCOL_VERSION})
+        resp, _ = await p.call(
+            2, _method("session_new", "session/new"), {"cwd": str(tmp_path), "mcpServers": []}
+        )
+        assert "error" not in resp, resp
+        session_id = resp["result"]["sessionId"]
+
+        resp, notifications = await p.call(
+            3,
+            _method("session_prompt", "session/prompt"),
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": "有哪些 txt"}]},
+        )
+        assert "error" not in resp, resp
+        assert resp["result"]["stopReason"] == "end_turn"
+        assert "找到 1 个文件" in _collect_text(notifications)
+
+        kinds = [u["kind"] for u in _updates(notifications) if u.get("kind")]
+        assert "search" in kinds, f"kind 没按工具映射：{kinds}"
+
+        outputs = [str(u.get("rawOutput") or "") for u in _updates(notifications)]
+        assert any("hello.txt" in o for o in outputs), outputs
+    finally:
+        await p.stop()

@@ -45,6 +45,12 @@ class ToolBinding:
     full_name: str     # 暴露给 LLM 的名字：{server}__{tool}
     description: str = ""
     parameters: dict = field(default_factory=lambda: {"type": "object", "properties": {}})
+    # MCP 的 annotations 是**可选**提示，服务端可以一个都不给（默认 None）。
+    # 存在的意义：MCP 协议里没有 ACP 的 kind 概念，这两个 hint 是我们唯一能拿到的
+    # 信号 —— read_only 用来选图标，destructive 用来决定要不要弹审批。
+    # 是 None 而不是 False：None 表示"没声明"，False 表示"明确说了不是"。
+    read_only: bool | None = None
+    destructive: bool | None = None
 
 
 def _as_str_map(raw: Any) -> dict[str, str]:
@@ -82,6 +88,20 @@ def _as_config(raw: Any) -> dict | None:
         if isinstance(data, dict):
             return data
     return None
+
+
+def _as_hint(annotations: Any, field: str) -> bool | None:
+    """从 MCP 的 ToolAnnotations 里取一个 bool hint；没有就返回 None。
+
+    None 与 False 在这里是有区别的：None = 服务端没声明，False = 明确声明为否。
+    决策层需要区分这两种情况（见 tools.needs_approval）。
+    """
+    if annotations is None:
+        return None
+    value = getattr(annotations, field, None)
+    if value is None and isinstance(annotations, dict):
+        value = annotations.get(field)
+    return bool(value) if value is not None else None
 
 
 def _result_text(result: Any) -> str:
@@ -151,12 +171,15 @@ class McpHub:
         self._sessions[name] = session
         for tool in listed.tools:
             full = f"{name}__{tool.name}"
+            ann = getattr(tool, "annotations", None)
             self._tools[full] = ToolBinding(
                 server=name,
                 tool=tool.name,
                 full_name=full,
                 description=tool.description or "",
                 parameters=tool.input_schema or {"type": "object", "properties": {}},
+                read_only=_as_hint(ann, "read_only_hint"),
+                destructive=_as_hint(ann, "destructive_hint"),
             )
         _log(f"[agentd] MCP server {name} 接入，工具 {len(listed.tools)} 个")
 

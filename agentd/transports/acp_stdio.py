@@ -25,6 +25,8 @@ from acp import (
     update_agent_thought_text,
     update_tool_call,
 )
+# PermissionOption / ToolCallUpdate 没在 acp 顶层导出，只能从 schema 取
+from acp.schema import PermissionOption, ToolCallUpdate
 
 from ..contracts import (
     Done,
@@ -35,6 +37,7 @@ from ..contracts import (
     ToolCallStart,
 )
 from ..kernel.kernel import AgentKernel
+from ..kernel.tools import ApprovalRequest, ApproveHandler
 
 # ACP 的 stop_reason 取值是固定的五种，其中没有 "error"：
 #   end_turn | max_tokens | max_turn_requests | refusal | cancelled
@@ -49,8 +52,32 @@ _STOP_REASON_MAP = {
 # 内核的 kind/status 取值与 ACP schema 不完全重合，映射一下才合法：
 #   ACP ToolKind   = read|edit|delete|move|search|execute|think|fetch|switch_mode|other
 #   ACP ToolStatus = pending|in_progress|completed|failed
-_ACP_KIND = {"read": "read", "edit": "edit", "execute": "execute", "generic": "other"}
+# kernel 侧多一个 "generic"（"不知道是哪类"）—— 唯一需要额外译的就是它；
+# 其余取值与 ACP 同名，逐条列出来是为了**改 ACP schema 时能一眼看出差集**，
+# 而不是靠默认分支悄悄兜住（默认兜住的后果是客户端收到非法 kind 后静默卡死）。
+_ACP_KIND = {
+    "read": "read",
+    "edit": "edit",
+    "delete": "delete",
+    "move": "move",
+    "search": "search",
+    "execute": "execute",
+    "think": "think",
+    "fetch": "fetch",
+    "switch_mode": "switch_mode",
+    "other": "other",
+    "generic": "other",
+}
 _ACP_STATUS = {"completed": "completed", "failed": "failed", "cancelled": "failed"}
+
+# 审批弹窗给用户的三个选项。option_id 是我们自己定的字符串，
+# 客户端只负责把它原样回传（见 _make_approver 里的解析）。
+_PERMISSION_OPTIONS = (
+    PermissionOption(option_id="allow_once", name="允许一次", kind="allow_once"),
+    PermissionOption(option_id="allow_session", name="本会话总是允许", kind="allow_always"),
+    PermissionOption(option_id="reject", name="拒绝", kind="reject_once"),
+)
+_ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session"})
 
 
 class AgentdAcpAgent(Agent):
@@ -65,6 +92,10 @@ class AgentdAcpAgent(Agent):
         self._conn: Any = None
         self._client_caps: Any = None
         self._session_modes: dict[str, str] = {}
+        # 会话 → 已被"本会话总是允许"放行的工具名集合。
+        # 审批记忆放在传输层而不是内核里：它是「客户端怎么问用户」的一部分，
+        # 换个客户端（HTTP、TUI）记忆策略完全可以不一样，内核不该替它决定。
+        self._allow_all: dict[str, set[str]] = {}
 
     @staticmethod
     def _log(msg: str) -> None:
@@ -126,6 +157,51 @@ class AgentdAcpAgent(Agent):
         """目前只记日志 —— 真正的中断要让内核在 handle() 里响应取消信号。"""
         self._log(f"[agentd] 收到取消请求 session={session_id}（暂未实现中断）")
 
+    # ---- 审批 ----
+
+    def _make_approver(self, session_id: str) -> ApproveHandler:
+        """造一个绑好 session 的审批回调，交给内核。
+
+        踩过的坑：**客户端可能根本没实现 session/request_permission**（ACP 的
+        clientCapabilities 里有这一项）。这时 request_permission 会一直等不到响应
+        或者直接报错。所以这里三件事一起做：问之前先查"本会话总是允许"的记忆、
+        出错就按拒绝处理并打日志、把结果原样翻译成 bool。
+        """
+
+        async def approve(req: ApprovalRequest) -> bool:
+            granted = self._allow_all.setdefault(session_id, set())
+            if req.tool in granted:
+                return True  # 之前选过"本会话总是允许"，不再打扰用户
+
+            tool_call = ToolCallUpdate(
+                tool_call_id=req.call_id,
+                kind=_ACP_KIND.get(req.kind, "other"),  # type: ignore[arg-type]
+                title=req.title,
+                raw_input={"detail": req.detail} if req.detail else None,
+            )
+            self._log(f"[agentd] 请求审批：{req.tool}（{req.detail or '无摘要'}）")
+            try:
+                resp = await self._conn.request_permission(
+                    session_id, tool_call=tool_call, options=list(_PERMISSION_OPTIONS)
+                )
+            except Exception as exc:  # noqa: BLE001 - 客户端不支持时按拒绝处理
+                self._log(f"[agentd] 审批请求失败（按拒绝处理）：{type(exc).__name__}: {exc}")
+                return False
+
+            outcome = getattr(resp, "outcome", None)
+            verdict = getattr(outcome, "outcome", None)
+            if verdict == "selected":
+                option_id = str(getattr(outcome, "option_id", "") or "")
+                if option_id == "allow_session":
+                    granted.add(req.tool)
+                return option_id in _ALLOW_OPTION_IDS
+            # "cancelled"（用户关掉弹窗）或任何没见过的形状 —— 一律不放行。
+            # 审批这种东西，拿不准的时候必须往"拒绝"倒，反过来就是安全漏洞。
+            self._log(f"[agentd] 审批未通过：{req.tool} outcome={verdict!r}")
+            return False
+
+        return approve
+
     async def prompt(
         self, session_id: str, prompt: list[Any], **kwargs: Any
     ) -> PromptResponse:
@@ -139,7 +215,9 @@ class AgentdAcpAgent(Agent):
 
         stop_reason = "end_turn"
 
-        async for event in self._kernel.handle(session_id, text, mode=mode):
+        async for event in self._kernel.handle(
+            session_id, text, mode=mode, approve=self._make_approver(session_id)
+        ):
             if isinstance(event, MessageDelta):
                 await self._conn.session_update(
                     session_id, update_agent_message_text(event.text)

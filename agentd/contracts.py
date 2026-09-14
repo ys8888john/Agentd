@@ -10,6 +10,24 @@ import uuid
 from typing import Annotated, Literal, TypeAlias, Union
 from pydantic import BaseModel, Field, TypeAdapter
 
+# 工具调用的类别。取值对齐 ACP 的 ToolKind —— 客户端据此选图标、决定要不要弹审批。
+# 多一个 "generic" 表示"不确定是哪类"，传输层会把它译成 ACP 的 "other"。
+# 为什么不干脆用 str：kernel 产出的 kind 一旦拼错，ACP 那边是**校验失败**，
+# 而失败的表现是客户端静默卡住。放在 Literal 里，拼错当场 ValidationError。
+ToolKind = Literal[
+    "read",
+    "edit",
+    "delete",
+    "move",
+    "search",
+    "execute",
+    "think",
+    "fetch",
+    "switch_mode",
+    "other",
+    "generic",
+]
+
 class EventBase(BaseModel):
     """所有事件的公共字段。run_id 区分同一次执行（一次 prompt 可能触发多次 LLM 调用）。"""
 
@@ -37,8 +55,8 @@ class ToolCallStart(EventBase):
     type: Literal["tool_call_start"] = "tool_call_start"
     call_id: str
     title: str
-    # kind 决定前端用哪个图标；"execute" 类通常要触发权限确认
-    kind: Literal["read", "edit", "execute", "generic"] = "generic"
+    # kind 决定前端用哪个图标；edit / execute 类通常会先弹权限确认
+    kind: ToolKind = "generic"
 
 
 class ToolCallDone(EventBase):

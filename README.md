@@ -38,6 +38,10 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 | `AGENTD_SYSTEM_PROMPT` | 系统提示词 | 空 |
 | `AGENTD_STORE` | `sqlite` / `memory` | `sqlite` |
 | `AGENTD_DB_PATH` | SQLite 会话库位置 | `~/.agentd/sessions.db` |
+| `AGENTD_TOOLS` | 原生工具范围：`native` / `read_only` / `off` | `native` |
+| `AGENTD_TOOLS_ALLOW_OUTSIDE` | 允许原生工具访问 cwd 之外的路径 | `false` |
+| `AGENTD_TOOLS_TIMEOUT` | `run_command` 默认超时（秒） | `30` |
+| `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none` | `native` |
 
 ### `script` 后端：不靠模型也能验工具链
 
@@ -67,9 +71,55 @@ stdio MCP server → 工具事件 → 界面 reducer）跑通的，不需要 Oll
 | `single` | 调一次 LLM 就结束。无工具的老行为。 |
 | `agent` | **默认**。工具循环：LLM → 若要调工具就执行 → 结果回灌 → 再调 LLM → 直到出纯文本（上限 12 步）。没有可用工具时与 `single` 等价。 |
 
+## 工具：原生工具 + MCP
+
+agent 模式下的工具来自两条路，对模型完全透明（合并成一个 `tools` 数组，
+靠名字路由回各自的执行器）：
+
+### 1. 原生工具（进程内，默认开启）
+
+| 工具 | kind | 要不要审批 | 干什么 |
+|---|---|---|---|
+| `read_file` | `read` | 否 | 读文本文件，返回带行号的内容，支持 `offset` / `limit` |
+| `glob` | `search` | 否 | 按通配符找文件（支持 `**`），按修改时间倒序 |
+| `grep` | `search` | 否 | 正则搜内容，返回 `文件:行号: 内容`，自动跳过 `.git` / `node_modules` |
+| `write_file` | `edit` | **是** | 整体写文件（覆盖），父目录自动创建 |
+| `edit` | `edit` | **是** | 精确字符串替换；`old_string` 不唯一时报错，除非 `replace_all=true` |
+| `run_command` | `execute` | **是** | 在工作目录跑 shell 命令，返回退出码 + stdout/stderr |
+
+约束与限额：路径必须落在会话 cwd 内（`..` 会被 `resolve` 展开后再判，
+`AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；单次返回文本上限 64KB；
+`run_command` 默认 30 秒超时、非零退出码按失败上报。
+
+**为什么不全走 MCP。** MCP 的 stdio 客户端内部是 anyio task group，
+必须与 enter/exit 同 task，所以现在每轮 run 都要现开现关一次子进程
+（见 `mcp.py` 的生命周期说明）。读文件、搜代码这类动作一次对话要用几十次，
+全走 MCP 等于每轮重启一次 node/python。所以「高频、无状态、纯本地」的动作
+放进程内做；MCP 留给「本来就是独立服务」的能力（fetch / git / 数据库 / 厂商托管）。
+
+### 2. MCP 工具（客户端声明，agent 连）
+
 MCP server 由**客户端**在 `session/new` 里声明（ACP 的设计就是"客户端声明、agent 连"），
 内核每轮用 `McpHub` 现开现关地连上它们，把工具列成 `{server}__{tool}` 暴露给模型。
 `agentd` 自己不读任何 MCP 配置文件 —— 那是前端的事。
+
+MCP 协议里没有 ACP 的 kind 概念，所以只能从 `annotations` 反推：
+`readOnlyHint=true` 当只读（图标是"读"，不弹审批），其余一律按 `execute` 呈现 ——
+对没声明的东西保守一点。审批同理，只看工具自己声明的 `destructiveHint`，
+不替它猜。
+
+### 审批
+
+会改变外部状态的动作在**真正执行前**停下来问一次。ACP 侧走
+`session/request_permission`，弹三个选项：允许一次 / 本会话总是允许 / 拒绝。
+
+- **只读动作（`read` / `search`）在任何策略下都不弹。** 每个 `ls` 都弹窗，
+  用户三分钟就学会无脑点"允许"，审批本身也就废了。
+- 选过"本会话总是允许"的工具名会被记住（记忆在传输层，换客户端可以换策略）。
+- 审批通道出错 / 客户端没实现该能力 / 用户关掉弹窗，**一律按拒绝处理**。
+  审批这种拿不准的事必须往"拒绝"倒，反过来就是安全漏洞。
+- 被拒后工具输出 `[错误] 用户拒绝执行 xxx`、`status=cancelled`，模型能看到这条
+  反馈并绕路，整轮对话继续。
 
 ## 会话持久化
 
@@ -160,6 +210,31 @@ firewall=false
   `McpServerStdio` 实例。`McpHub` 早先只认 dict，`isinstance(raw, dict)` 为假就
   把整条静默跳过 —— 现象是日志说"接入 1 个 server"但一个工具都列不出来。
   现在 `_as_config()` 兼容两种形态（`test_mcp_hub_accepts_acp_pydantic_model_config`）。
+- **工具事件的 `kind` 必须是 ACP 的合法取值。** ACP 只认
+  `read|edit|delete|move|search|execute|think|fetch|switch_mode|other`，
+  内核多一个 `generic`（传输层译成 `other`）。取值对不上时的表现不是报错，而是
+  **客户端静默卡在"运行中"**，两边日志都干干净净。所以 `contracts.ToolCallKind`
+  写成 `Literal`（拼错当场 ValidationError），并且
+  `test_acp_kind_covers_every_kernel_toolkind` 直接从 Literal 里取全部取值去比对 ——
+  以后往 contracts 加新 kind，那个测试会立刻红。
+- **审批问不到人时必须按拒绝处理。** `ctx.approve is None`（TUI / 单测）才是放行；
+  一旦有回调但回调抛异常（客户端没实现 `session/request_permission`、
+  请求超时、用户关掉弹窗），`AgentdAcpAgent._make_approver` 和
+  `ModeContext.request_approval` 都会返回 False。这个方向的取舍不能反 ——
+  反了就是"审批通道一坏，所有写操作自动放行"。
+- **原生工具的路径必须 `resolve()` 之后再判越界。** 直接字符串比较
+  `startswith(cwd)` 会放过 `../`，`Path.resolve()` 把 `..` 和符号链接都展开过，
+  再 `relative_to(root)` 才是可靠的判据（`test_path_escape_outside_root_is_rejected`）。
+- **ACP 的 `ToolCallStatus` 里没有 `cancelled`。** 只有
+  `pending|in_progress|completed|failed`。所以内核里"用户拒绝了这个工具"这个
+  状态到了协议层被迫折成 `failed`（见 `_ACP_STATUS`）—— 于是"用户主动拒绝"和
+  "工具真的炸了"在协议上长得一模一样。唯一的载体是输出的那行文案：
+  `[错误] 用户拒绝执行 {tool}`。客户端靠这个字面量把它还原成 `cancelled`
+  （ForgeAgent-GUI 的 `acp_client.DENY_MARK`）。两个仓库各自定义同一个字面量，
+  改一处就要改另一处；改了不生效的表现是界面上"你点的拒绝"显示成红色"失败"。
+- **审批回调抛异常 = 拒绝，不是放行。** `ModeContext.request_approval` 和
+  `acp_stdio._make_approver` 都往"拒绝"倒。`ctx.approve is None`（TUI / 单测 /
+  无人值守）才是放行。这个方向反了就是"审批通道一坏，所有写操作自动通过"。
 
 ## 测试
 
@@ -171,3 +246,22 @@ pytest -q
 MCP 工具循环的测试分三层：`AgentMode` 用假 Hub 测循环逻辑、`McpHub` 连真 stdio
 echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链路的真实验证
 （含前端）在 ForgeAgent-GUI 的 `scripts/mcp_e2e.py`。
+
+原生工具的测试在 `tests/test_native_tools.py`，同样分四层：
+
+1. 六个工具各自的行为（真文件系统，全在 `tmp_path` 里）；
+2. 路径边界（`../` 越界、`allow_outside`）与 profile（`read_only` 挡不挡得住写）；
+3. `needs_approval` 判定矩阵 + `AgentMode` 的 kind 映射 / 审批通过 / 审批拒绝 /
+   审批通道抛异常；
+4. ACP 映射：`_ACP_KIND` 覆盖所有 kernel kind、`session/request_permission` 的
+   三种应答（允许一次 / 本会话总是允许 / 取消）各自的翻译结果。
+
+再往上一层是 `tests/test_acp.py::test_native_tool_over_real_stdio`：起真子进程，
+用 `script` 后端回放"模型要 glob" → 断言工具真执行了、`kind` 是 `search`、
+stdout 上依然只有 JSON-RPC 帧。不依赖 Ollama。
+
+**跨仓库的真实验证**在 ForgeAgent-GUI 的 `scripts/native_tools_e2e.py`：
+它用真 `AcpClient` 拉起真 agentd，回放"读 + 搜（不该弹审批）→ 写（该弹审批）"，
+然后断言只弹了一次审批、`kind` 分别是 `read`/`search`/`edit`、
+允许时文件真的落盘 / 拒绝时文件绝不存在。这一步是唯一能证明**两个仓库
+对审批帧的理解真的一致**的东西 —— 两边各自打自己造的帧，字段名对不上也测不出来。

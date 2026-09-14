@@ -89,6 +89,11 @@ class Settings:
     system_prompt: str | None
     store_backend: str          # sqlite | memory
     db_path: str
+    # 原生工具（进程内 read_file/glob/grep/write_file/edit/run_command）
+    tools: str                  # native | read_only | off
+    tools_allow_outside: bool   # 是否允许碰 cwd 之外的路径
+    tools_timeout: float        # run_command 超时（秒）
+    tools_approve: str          # native | all | none
 
 
 def load_settings() -> Settings:
@@ -110,6 +115,13 @@ def load_settings() -> Settings:
         system_prompt=os.getenv("AGENTD_SYSTEM_PROMPT") or None,
         store_backend=_env("AGENTD_STORE", "sqlite").lower(),
         db_path=_env("AGENTD_DB_PATH", str(default_db_path())),
+        tools=_env("AGENTD_TOOLS", "native").lower(),
+        # 默认**不允许**越出 cwd：agent 的工作目录就是它的世界。
+        # 越界读 .ssh / 系统配置这种事，出一次就够吓人了，放开要显式声明。
+        tools_allow_outside=_env("AGENTD_TOOLS_ALLOW_OUTSIDE", "false").lower() == "true",
+        tools_timeout=float(_env("AGENTD_TOOLS_TIMEOUT", "30")),
+        # 默认只拦原生写/执行类（+ MCP 自己标了 destructive 的工具），见 tools.needs_approval
+        tools_approve=_env("AGENTD_TOOLS_APPROVE", "native").lower(),
     )
 
 
@@ -170,5 +182,11 @@ def build_store(settings: Settings | None = None) -> SessionStore:
 def build_kernel(settings: Settings | None = None) -> AgentKernel:
     s = settings or load_settings()
     return AgentKernel(
-        llm=build_llm(s), store=build_store(s), system=s.system_prompt
+        llm=build_llm(s),
+        store=build_store(s),
+        system=s.system_prompt,
+        native_tools=s.tools,
+        tools_allow_outside=s.tools_allow_outside,
+        tools_timeout=s.tools_timeout,
+        approval_policy=s.tools_approve,
     )
