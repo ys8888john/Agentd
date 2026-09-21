@@ -254,6 +254,66 @@ async def test_openai_compat_skips_non_data_lines(monkeypatch):
     assert chunks == ["x"]
 
 
+async def test_mimo_reasoning_content_not_leaked_to_text(monkeypatch):
+    """MiMo 是推理模型：流里会先来一堆 reasoning_content 增量。
+
+    这些思考内容只能留在模型侧 —— 混进正文的话，客户端会把"让我想想…"
+    当成回复渲染出来。锁定 content 与 reasoning_content 分轨的行为。
+    """
+
+    class FakeClient(_FakeClient):
+        _lines = [
+            "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "让我想想…"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"content": "答"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": ""}}]}),
+            "data: [DONE]",
+        ]
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    llm = OpenAICompatLLM(base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5-pro", api_key="k")
+    chunks = [c async for c in llm.stream([Message.user("hi")])]
+    assert chunks == ["答"]
+
+
+async def test_mimo_402_balance_error_is_surfaced(monkeypatch):
+    """真实踩过的错误路径（2026-09-21）：key 有效但账户没余额。
+
+    MiMo 返回 HTTP 402 + `{"error":{"code":"402","message":"Insufficient
+    account balance",...}}`。这些信息必须出现在异常里 —— 吞掉的话前端
+    又是"回复一片空白"，用户不知道要充值。
+    """
+
+    class Ctx(_FakeStreamCtx):
+        status_code = 402
+
+        async def aread(self):
+            return (
+                b'{"error":{"code":"402","message":"Insufficient account balance",'
+                b'"type":"insufficient_balance"}}'
+            )
+
+    class C(_FakeClient):
+        _lines = []
+
+        def stream(self, method, url, json=None, headers=None):
+            type(self).captured = {"url": url}
+            return Ctx([])
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+
+    llm = OpenAICompatLLM(
+        base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5-pro", api_key="sk-t"
+    )
+    with pytest.raises(LLMError) as exc:
+        async for _ in llm.stream([Message.user("hi")]):
+            pass
+
+    msg = str(exc.value)
+    assert "402" in msg
+    assert "Insufficient account balance" in msg
+
+
 # 已知拼写坑的锁定测试（与 models.py 的 assistent 拼写坑同惯例）
 def test_ollama_stream_return_annotation_is_asyncgenerator():
     """OllamaNativeLLM.stream 的返回注解必须是 AsyncIterator。

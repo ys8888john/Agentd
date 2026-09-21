@@ -83,6 +83,10 @@ class Settings:
     openai_base_url: str
     openai_model: str
     openai_api_key: str
+    # 小米 MiMo 开放平台（OpenAI 兼容端点，backend=mimo 时用）
+    mimo_base_url: str
+    mimo_model: str
+    mimo_api_key: str
     fake_reply: str
     script_file: str           # backend=script：脚本文件路径（与 script_json 二选一）
     script_json: str           # backend=script：内联脚本 JSON（优先于 script_file）
@@ -109,6 +113,12 @@ def load_settings() -> Settings:
         openai_base_url=_env("AGENTD_OPENAI_BASE_URL", "http://localhost:11434/v1"),
         openai_model=_env("AGENTD_OPENAI_MODEL", "qwen3"),
         openai_api_key=_env("AGENTD_OPENAI_API_KEY", "ollama"),
+        # MiMo 的 key 官方习惯叫 MIMO_API_KEY，但它不带 AGENTD_ 前缀，
+        # 写进 .env 不会被 load_dotenv 读进来 —— 所以主名用 AGENTD_MIMO_API_KEY，
+        # MIMO_API_KEY 作为兜底（直接 export 它时照常生效）。
+        mimo_base_url=_env("AGENTD_MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"),
+        mimo_model=_env("AGENTD_MIMO_MODEL", "mimo-v2.5-pro"),
+        mimo_api_key=_env("AGENTD_MIMO_API_KEY", "") or os.getenv("MIMO_API_KEY", ""),
         fake_reply=_env("AGENTD_FAKE_REPLY", "这是 FakeLLM 的固定回复。"),
         script_file=_env("AGENTD_SCRIPT_FILE", ""),
         script_json=os.getenv("AGENTD_SCRIPT_JSON", ""),
@@ -140,6 +150,19 @@ def build_llm(settings: Settings | None = None) -> LLM:
             model=s.openai_model,
             api_key=s.openai_api_key,
             prefer=s.ollama_prefer,
+        )
+    if s.backend == "mimo":
+        # 小米 MiMo 开放平台：与 OpenAI 兼容的 /v1 端点（chat/completions + models）。
+        # 按量付费 sk- 开头的 Key；缺 key 在启动时报，别等第一次对话才炸。
+        if not s.mimo_api_key:
+            raise ValueError(
+                "backend=mimo 需要 AGENTD_MIMO_API_KEY（.env / 环境变量均可，"
+                "或直接 export MIMO_API_KEY=...）"
+            )
+        return OpenAICompatLLM(
+            base_url=s.mimo_base_url,
+            model=s.mimo_model,
+            api_key=s.mimo_api_key,
         )
     if s.backend == "fake":
         from .kernel.llm import FakeLLM

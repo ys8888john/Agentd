@@ -26,12 +26,14 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `AGENTD_LLM_BACKEND` | `ollama` / `openai_compat` / `fake` / `script` | `ollama` |
+| `AGENTD_LLM_BACKEND` | `ollama` / `openai_compat` / `mimo` / `fake` / `script` | `ollama` |
 | `AGENTD_OLLAMA_HOST` | Ollama 地址 | `http://localhost:11434` |
 | `AGENTD_OLLAMA_MODEL` | 模型名，**`auto` = 去 `/api/tags` 问本机有什么** | `auto` |
 | `AGENTD_OLLAMA_PREFER` | auto 时的偏好顺序（子串匹配） | `qwen3.5,qwen3,glm,…` |
 | `AGENTD_OLLAMA_THINK` | Ollama 原生 think 参数 | `false` |
 | `AGENTD_OPENAI_BASE_URL` / `_MODEL` / `_API_KEY` | OpenAI 兼容端点三件套 | `http://localhost:11434/v1` / `qwen3` / `ollama` |
+| `AGENTD_MIMO_API_KEY` / `AGENTD_MIMO_MODEL` | 小米 MiMo（OpenAI 兼容）：key（兜底读真实环境变量 `MIMO_API_KEY`）/ 模型 | 空（必填）/ `mimo-v2.5-pro` |
+| `AGENTD_MIMO_BASE_URL` | MiMo 端点，Token Plan 要换成 tp- 专属地址 | `https://api.xiaomimimo.com/v1` |
 | `AGENTD_FAKE_REPLY` | `fake` 后端的固定回复 | 一句话 |
 | `AGENTD_SCRIPT_JSON` | `script` 后端的回放脚本（内联 JSON，优先） | 空 |
 | `AGENTD_SCRIPT_FILE` | `script` 后端的回放脚本（文件路径） | 空 |
@@ -64,6 +66,33 @@ python -m agentd.server
 
 GUI 侧的 `scripts/mcp_e2e.py` 就是靠它把整条链路（mcp.json → ACP → agentd → 真
 stdio MCP server → 工具事件 → 界面 reducer）跑通的，不需要 Ollama。
+
+### `mimo` 后端：小米 MiMo 开放平台
+
+MiMo 提供 OpenAI 兼容协议（`https://api.xiaomimimo.com/v1`），所以后端就是
+`OpenAICompatLLM` 加了一组预设，没有新协议代码：
+
+```bash
+AGENTD_LLM_BACKEND=mimo \
+AGENTD_MIMO_API_KEY=sk-xxxx \
+python -m agentd.server
+```
+
+两个实现决定：
+
+- **模型默认写死 `mimo-v2.5-pro` 而不是 `auto`。** MiMo 的 `/v1/models` 会把
+  `mimo-v2.5-asr` / `mimo-v2.5-tts` 这些非对话模型一并列出来，auto 按子串匹配
+  挑错一个就是一次 404/400；云端模型的差异也不像本机 Ollama 那样"装什么用什么"，
+  默认值就写给官方示例模型，要换显式改 `AGENTD_MIMO_MODEL`（设成 `auto` 仍可走列表探测）。
+- **余额不足必须在第一次调用时就看得懂。** 实测 key 有效但没余额时，chat 返回
+  HTTP 402 + `Insufficient account balance`，这条会被转成 `LLMError` 原样带出来
+  （`test_mimo_402_balance_error_is_surfaced`），不会表现为"回复空白"。
+
+真 key 的连通性验证（默认跳过，防止 CI 无 key 红）：
+
+```bash
+AGENTD_LIVE_MIMO=1 AGENTD_MIMO_API_KEY=sk-xxxx pytest tests/test_mimo_live.py -v
+```
 
 ## 模式：single / agent
 

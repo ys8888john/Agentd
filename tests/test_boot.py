@@ -10,8 +10,8 @@ import os
 
 import pytest
 
-from agentd.boot import _parse_dotenv, build_kernel, build_store, load_dotenv, load_settings
-from agentd.kernel.llm import AUTO
+from agentd.boot import _parse_dotenv, build_llm, build_kernel, build_store, load_dotenv, load_settings
+from agentd.kernel.llm import AUTO, OpenAICompatLLM
 from agentd.kernel.store import InMemorySessionStore, SqliteSessionStore
 
 
@@ -166,3 +166,40 @@ def test_build_store_reports_unusable_db_path(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="AGENTD_STORE=memory"):
         build_store()
+
+
+# ---- MiMo 后端 ----
+
+def _mimo_env(monkeypatch) -> None:
+    """把环境收干净，让每个测试从同一张白纸开始。"""
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_LLM_BACKEND", "mimo")
+    monkeypatch.delenv("AGENTD_MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("AGENTD_MIMO_MODEL", raising=False)
+    monkeypatch.delenv("AGENTD_MIMO_BASE_URL", raising=False)
+
+
+def test_build_llm_mimo_defaults(monkeypatch):
+    _mimo_env(monkeypatch)
+    monkeypatch.setenv("AGENTD_MIMO_API_KEY", "sk-test")
+
+    llm = build_llm()
+    assert isinstance(llm, OpenAICompatLLM)
+    assert llm.base_url == "https://api.xiaomimimo.com/v1"
+    assert llm.model == "mimo-v2.5-pro"
+    assert llm.api_key == "sk-test"
+
+
+def test_build_llm_mimo_falls_back_to_mimo_api_key_env(monkeypatch):
+    """官方习惯名 MIMO_API_KEY（真实环境变量）也要认 —— 但 .env 里写它不生效，见 boot.py。"""
+    _mimo_env(monkeypatch)
+    monkeypatch.setenv("MIMO_API_KEY", "sk-official-name")
+    assert build_llm().api_key == "sk-official-name"
+
+
+def test_build_llm_mimo_without_key_raises(monkeypatch):
+    """缺 key 必须在启动时报，不能等用户发了第一条消息才炸。"""
+    _mimo_env(monkeypatch)
+    with pytest.raises(ValueError, match="AGENTD_MIMO_API_KEY"):
+        build_llm()
