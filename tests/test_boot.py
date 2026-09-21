@@ -203,3 +203,37 @@ def test_build_llm_mimo_without_key_raises(monkeypatch):
     _mimo_env(monkeypatch)
     with pytest.raises(ValueError, match="AGENTD_MIMO_API_KEY"):
         build_llm()
+
+
+# ---- 智谱 BigModel 后端 ----
+
+def _zhipu_env(monkeypatch) -> None:
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_LLM_BACKEND", "zhipu")
+    monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("AGENTD_ZHIPU_MODEL", raising=False)
+    monkeypatch.delenv("AGENTD_ZHIPU_BASE_URL", raising=False)
+
+
+def test_build_llm_zhipu_defaults(monkeypatch):
+    _zhipu_env(monkeypatch)
+    monkeypatch.setenv("AGENTD_ZHIPU_API_KEY", "id.secret")
+
+    llm = build_llm()
+    assert isinstance(llm, OpenAICompatLLM)
+    assert llm.base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert llm.model == "glm-4.5-air"
+    assert llm.api_key == "id.secret"
+
+
+def test_build_llm_zhipu_falls_back_to_zhipu_api_key_env(monkeypatch):
+    _zhipu_env(monkeypatch)
+    monkeypatch.setenv("ZHIPU_API_KEY", "id.secret-from-env")
+    assert build_llm().api_key == "id.secret-from-env"
+
+
+def test_build_llm_zhipu_without_key_raises(monkeypatch):
+    _zhipu_env(monkeypatch)
+    with pytest.raises(ValueError, match="AGENTD_ZHIPU_API_KEY"):
+        build_llm()

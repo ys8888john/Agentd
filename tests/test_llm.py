@@ -314,6 +314,41 @@ async def test_mimo_402_balance_error_is_surfaced(monkeypatch):
     assert "Insufficient account balance" in msg
 
 
+async def test_zhipu_401_auth_error_is_surfaced(monkeypatch):
+    """真实踩过的错误路径（2026-09-21）：只用 Key 的 id 段（缺 .secret）调智谱。
+
+    BigModel 返回 HTTP 401 + `{"error":{"code":"401","message":"令牌已过期
+    或验证不正确"}}`。这个信息必须进异常——否则前端又是"回复一片空白"，
+    用户不知道要去查 Key 是否完整。
+    """
+
+    class Ctx(_FakeStreamCtx):
+        status_code = 401
+
+        async def aread(self):
+            return '{"error":{"code":"401","message":"令牌已过期或验证不正确"}}'.encode("utf-8")
+
+    class C(_FakeClient):
+        _lines = []
+
+        def stream(self, method, url, json=None, headers=None):
+            type(self).captured = {"url": url}
+            return Ctx([])
+
+    monkeypatch.setattr(httpx, "AsyncClient", C)
+
+    llm = OpenAICompatLLM(
+        base_url="https://open.bigmodel.cn/api/paas/v4", model="glm-4.5-air", api_key="id-only"
+    )
+    with pytest.raises(LLMError) as exc:
+        async for _ in llm.stream([Message.user("hi")]):
+            pass
+
+    msg = str(exc.value)
+    assert "401" in msg
+    assert "令牌已过期或验证不正确" in msg
+
+
 # 已知拼写坑的锁定测试（与 models.py 的 assistent 拼写坑同惯例）
 def test_ollama_stream_return_annotation_is_asyncgenerator():
     """OllamaNativeLLM.stream 的返回注解必须是 AsyncIterator。

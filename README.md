@@ -26,7 +26,7 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `AGENTD_LLM_BACKEND` | `ollama` / `openai_compat` / `mimo` / `fake` / `script` | `ollama` |
+| `AGENTD_LLM_BACKEND` | `ollama` / `openai_compat` / `mimo` / `zhipu` / `fake` / `script` | `ollama` |
 | `AGENTD_OLLAMA_HOST` | Ollama 地址 | `http://localhost:11434` |
 | `AGENTD_OLLAMA_MODEL` | 模型名，**`auto` = 去 `/api/tags` 问本机有什么** | `auto` |
 | `AGENTD_OLLAMA_PREFER` | auto 时的偏好顺序（子串匹配） | `qwen3.5,qwen3,glm,…` |
@@ -34,6 +34,8 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 | `AGENTD_OPENAI_BASE_URL` / `_MODEL` / `_API_KEY` | OpenAI 兼容端点三件套 | `http://localhost:11434/v1` / `qwen3` / `ollama` |
 | `AGENTD_MIMO_API_KEY` / `AGENTD_MIMO_MODEL` | 小米 MiMo（OpenAI 兼容）：key（兜底读真实环境变量 `MIMO_API_KEY`）/ 模型 | 空（必填）/ `mimo-v2.5-pro` |
 | `AGENTD_MIMO_BASE_URL` | MiMo 端点，Token Plan 要换成 tp- 专属地址 | `https://api.xiaomimimo.com/v1` |
+| `AGENTD_ZHIPU_API_KEY` / `AGENTD_ZHIPU_MODEL` | 智谱 BigModel（OpenAI 兼容）：key（兜底读真实环境变量 `ZHIPU_API_KEY`）/ 模型 | 空（必填）/ `glm-4.5-air` |
+| `AGENTD_ZHIPU_BASE_URL` | 智谱端点，注意路径是 `/api/paas/v4`（没有 `/v1`） | `https://open.bigmodel.cn/api/paas/v4` |
 | `AGENTD_FAKE_REPLY` | `fake` 后端的固定回复 | 一句话 |
 | `AGENTD_SCRIPT_JSON` | `script` 后端的回放脚本（内联 JSON，优先） | 空 |
 | `AGENTD_SCRIPT_FILE` | `script` 后端的回放脚本（文件路径） | 空 |
@@ -92,6 +94,31 @@ python -m agentd.server
 
 ```bash
 AGENTD_LIVE_MIMO=1 AGENTD_MIMO_API_KEY=sk-xxxx pytest tests/test_mimo_live.py -v
+```
+
+### `zhipu` 后端：智谱 BigModel 开放平台
+
+与 MiMo 同一个思路：OpenAI 兼容端点（`https://open.bigmodel.cn/api/paas/v4`）
+加一组预设，没有新协议代码：
+
+```bash
+AGENTD_LLM_BACKEND=zhipu \
+AGENTD_ZHIPU_API_KEY=xxxx.yyyy \
+python -m agentd.server
+```
+
+两个实现决定：
+
+- **默认模型 `glm-4.5-air`。** GLM 系列里 4.6v 是视觉、search-* 是联网搜索档，
+  `glm-4.6` 是强档；通用对话默认给 4.5-air，要切换显式改 `AGENTD_ZHIPU_MODEL`。
+- **Key 是两段的 `id.secret`。** 网页上"xxxx...yyyy"是脱敏显示，不能只拼 `id` 段用
+  —— 只用 id 段实测返回 401「令牌已过期或验证不正确」。secret 只有创建时能看，
+  掉了只能重新创建。
+
+真 key 的连通性验证同样默认跳过：
+
+```bash
+AGENTD_LIVE_ZHIPU=1 AGENTD_ZHIPU_API_KEY=xxxx.yyyy pytest tests/test_zhipu_live.py -v
 ```
 
 ## 模式：single / agent

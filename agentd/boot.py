@@ -87,6 +87,10 @@ class Settings:
     mimo_base_url: str
     mimo_model: str
     mimo_api_key: str
+    # 智谱 BigModel 开放平台（GLM 系列，OpenAI 兼容端点，backend=zhipu 时用）
+    zhipu_base_url: str
+    zhipu_model: str
+    zhipu_api_key: str
     fake_reply: str
     script_file: str           # backend=script：脚本文件路径（与 script_json 二选一）
     script_json: str           # backend=script：内联脚本 JSON（优先于 script_file）
@@ -119,6 +123,10 @@ def load_settings() -> Settings:
         mimo_base_url=_env("AGENTD_MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"),
         mimo_model=_env("AGENTD_MIMO_MODEL", "mimo-v2.5-pro"),
         mimo_api_key=_env("AGENTD_MIMO_API_KEY", "") or os.getenv("MIMO_API_KEY", ""),
+        # 智谱：AGENTD_ZHIPU_API_KEY 为主（.env 能生效），ZHIPU_API_KEY 兜底
+        zhipu_base_url=_env("AGENTD_ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+        zhipu_model=_env("AGENTD_ZHIPU_MODEL", "glm-4.5-air"),
+        zhipu_api_key=_env("AGENTD_ZHIPU_API_KEY", "") or os.getenv("ZHIPU_API_KEY", ""),
         fake_reply=_env("AGENTD_FAKE_REPLY", "这是 FakeLLM 的固定回复。"),
         script_file=_env("AGENTD_SCRIPT_FILE", ""),
         script_json=os.getenv("AGENTD_SCRIPT_JSON", ""),
@@ -163,6 +171,19 @@ def build_llm(settings: Settings | None = None) -> LLM:
             base_url=s.mimo_base_url,
             model=s.mimo_model,
             api_key=s.mimo_api_key,
+        )
+    if s.backend == "zhipu":
+        # 智谱 BigModel：与 OpenAI 兼容的 /api/paas/v4 端点（glm-4.x 系列）。
+        # 缺 key 在启动时报，别等第一次对话才炸。
+        if not s.zhipu_api_key:
+            raise ValueError(
+                "backend=zhipu 需要 AGENTD_ZHIPU_API_KEY（.env / 环境变量均可，"
+                "或直接 export ZHIPU_API_KEY=...）"
+            )
+        return OpenAICompatLLM(
+            base_url=s.zhipu_base_url,
+            model=s.zhipu_model,
+            api_key=s.zhipu_api_key,
         )
     if s.backend == "fake":
         from .kernel.llm import FakeLLM
