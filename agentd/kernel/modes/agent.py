@@ -25,8 +25,8 @@ import json
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
-from ...contracts import Event, MessageDelta, MessageDone, ToolCallDone, ToolCallStart
-from ..llm import LLMText, LLMToolCall
+from ...contracts import Event, MessageDelta, MessageDone, ThoughtDelta, ToolCallDone, ToolCallStart
+from ..llm import LLMText, LLMThought, LLMToolCall
 from ..mcp import McpHub, ToolBinding
 from ..models import Message, ToolCall
 from ..tools import ERROR_PREFIX, ApprovalRequest, NativeTool, needs_approval
@@ -87,6 +87,10 @@ class AgentMode(Mode):
                     if isinstance(event, LLMText):
                         text_parts.append(event.text)
                         yield MessageDelta(
+                            session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                        )
+                    elif isinstance(event, LLMThought):
+                        yield ThoughtDelta(
                             session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
                         )
                     elif isinstance(event, LLMToolCall):

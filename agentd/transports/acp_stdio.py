@@ -33,6 +33,7 @@ from ..contracts import (
     ErrorEvent,
     MessageDelta,
     MessageDone,
+    ThoughtDelta,
     ToolCallDone,
     ToolCallStart,
 )
@@ -221,6 +222,13 @@ class AgentdAcpAgent(Agent):
             if isinstance(event, MessageDelta):
                 await self._conn.session_update(
                     session_id, update_agent_message_text(event.text)
+                )
+
+            elif isinstance(event, ThoughtDelta):
+                # ACP 有现成的 thought 通道（GUI 暗色渲染），推理模型的
+                # reasoning_content 走这里，不污染正文
+                await self._conn.session_update(
+                    session_id, update_agent_thought_text(event.text)
                 )
 
             elif isinstance(event, MessageDone):

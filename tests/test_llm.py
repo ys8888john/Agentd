@@ -9,6 +9,8 @@ import pytest
 from agentd.kernel.llm import (
     AUTO,
     LLM,
+    LLMThought,
+    LLMText,
     LLMError,
     FakeLLM,
     OllamaNativeLLM,
@@ -274,6 +276,32 @@ async def test_mimo_reasoning_content_not_leaked_to_text(monkeypatch):
     llm = OpenAICompatLLM(base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5-pro", api_key="k")
     chunks = [c async for c in llm.stream([Message.user("hi")])]
     assert chunks == ["答"]
+
+
+async def test_zhipu_reasoning_content_streams_as_thought(monkeypatch):
+    """推理模型的 reasoning_content 应产出 LLMThought 增量（GUI 思考区可显示）。
+
+    之前这里是被直接丢弃的——GLM/MiMo 每次回答前都先思考一大段，
+    用户盯着空白屏幕十几秒只能干等。直播出来体验完全不同。
+    """
+
+    class FakeClient(_FakeClient):
+        _lines = [
+            "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "先想"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "一下"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"content": "答案"}}]}),
+            "data: [DONE]",
+        ]
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    llm = OpenAICompatLLM(base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5-pro", api_key="k")
+    events = [e async for e in llm.stream_events([Message.user("hi")])]
+
+    thoughts = [e.text for e in events if isinstance(e, LLMThought)]
+    texts = [e.text for e in events if isinstance(e, LLMText)]
+    assert "".join(thoughts) == "先想一下"  # 思考完整、分轨保留
+    assert texts == ["答案"]                # 正文不受影响
 
 
 async def test_mimo_402_balance_error_is_surfaced(monkeypatch):

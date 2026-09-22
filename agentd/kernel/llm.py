@@ -55,6 +55,16 @@ class LLMToolCall:
     arguments: str = "{}"
 
 
+@dataclass
+class LLMThought:
+    """推理模型的思考增量（reasoning_content / thinking）。
+
+    与回答文本分轨：不进正文、不落库，只直播给用户看。
+    """
+
+    text: str
+
+
 class LLM:
     """内核只认这个接口。
 
@@ -295,6 +305,9 @@ class OllamaNativeLLM(LLM):
                         if obj.get("error"):
                             raise LLMError(str(obj["error"]))
                         msg = obj.get("message") or {}
+                        thinking = msg.get("thinking") or ""
+                        if thinking:
+                            yield LLMThought(thinking)
                         text = msg.get("content") or ""
                         if text:
                             yield LLMText(text)
@@ -405,6 +418,11 @@ class OpenAICompatLLM(LLM):
                         if obj.get("error"):
                             raise LLMError(str(obj["error"]))
                         delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                        # GLM-4.5 / MiMo / DeepSeek 系推理模型的思考挂在
+                        # reasoning_content：分轨直播，绝不混进正文
+                        reasoning = delta.get("reasoning_content") or ""
+                        if reasoning:
+                            yield LLMThought(reasoning)
                         text = delta.get("content") or ""
                         if text:
                             yield LLMText(text)

@@ -42,6 +42,17 @@ class MessageDelta(EventBase):
     text: str
 
 
+class ThoughtDelta(EventBase):
+    """推理模型的思考增量（GLM / MiMo 的 reasoning_content、Ollama 的 thinking）。
+
+    与 MessageDelta 分轨：思考内容走 ACP 的 thought 通道（GUI 暗色渲染），
+    不进正文、不落库 —— 它是"模型在想什么"的直播，不是回答本身。
+    """
+
+    type: Literal["thought_delta"] = "thought_delta"
+    text: str
+
+
 class MessageDone(EventBase):
     """一条完整消息结束。内核给出权威完整文本，前端落库/复制/渲染都用它。"""
 
@@ -86,6 +97,7 @@ class Done(EventBase):
 Event: TypeAlias = Annotated[
     Union[
         MessageDelta,
+        ThoughtDelta,
         MessageDone,
         ToolCallStart,
         ToolCallDone,
