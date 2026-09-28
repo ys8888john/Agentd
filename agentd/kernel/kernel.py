@@ -15,12 +15,14 @@ from ..contracts import (
     Done,
     ErrorEvent,
     Event,
+    ToolCallDone,
+    ToolCallStart,
     MessageDone,
     new_run_id,
     new_session_id,
 )
 from .llm import LLM
-from .models import Message
+from .models import Message, ToolRecord
 from .modes import AgentMode, Mode, ModeContext, SingleMode
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox
@@ -153,7 +155,11 @@ class AgentKernel:
 
             # 用户消息先落库，这样传给模式的 history 里已经包含本轮输入
             await self.store.append(session_id, Message.user(user_input))
-            history = await self.store.history(session_id)
+            rows = await self.store.history(session_id)
+            # 工具记录（role="tool_record"）只服务客户端的历史回放（工具卡片），
+            # 不是对话语境 —— 严禁混进喂给 LLM 的消息序列，否则 OpenAI 兼容端点
+            # 会因为不认识的 role 直接 4xx。
+            history = [m for m in rows if m.role != "tool_record"]
 
             opts = self._session_opts.get(session_id, {})
             ctx = ModeContext(
@@ -171,10 +177,31 @@ class AgentKernel:
             )
 
             try:
+                # Start/Done 在这里配对出 (title, kind)：Done 事件本身不带这些字段，
+                # 内核本来就要顺着事件流走，查表比对契约加两个可选字段便宜
+                tool_meta: dict[str, tuple[str, str]] = {}
                 async for event in impl.run(ctx, user_input):
                     # 持久化由内核统一负责：模式只管产事件
                     if isinstance(event, MessageDone):
                         await self.store.append(session_id, Message.assistant(event.text))
+                    elif isinstance(event, ToolCallStart):
+                        tool_meta[event.call_id] = (event.title, event.kind)
+                    elif isinstance(event, ToolCallDone):
+                        title, kind = tool_meta.get(event.call_id, (event.call_id, "generic"))
+                        # 每张工具卡片整体落一条 tool_record 行：续聊时客户端能
+                        # 重放卡片，工具往返不再是"本轮内的临时状态"
+                        await self.store.append(
+                            session_id,
+                            Message.from_tool_record(
+                                ToolRecord(
+                                    call_id=event.call_id,
+                                    title=title,
+                                    kind=kind,
+                                    status=event.status,
+                                    output=event.output,
+                                )
+                            ),
+                        )
                     yield event
             except Exception as exc:  # noqa: BLE001 - 边界处统一转成事件
                 yield ErrorEvent(

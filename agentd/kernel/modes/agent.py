@@ -15,8 +15,9 @@
 `ctx.request_approval()`。这是本模式唯一一处「停下来等外部输入」的地方 ——
 走回调而不是事件，理由见 ModeContext.approve 的注释。
 
-持久化仍由内核统一负责（只存最终的 MessageDone），中间的工具往返是本轮内的
-临时消息，不落库 —— 与现有内核约定一致。
+持久化仍由内核统一负责：每张工具卡片整体落一条 role="tool_record" 行（历史
+回放用），assistant 的最终回复落 MessageDone；给 LLM 的上下文会把 tool_record
+行过滤掉（模式不用关心这件事）。
 """
 
 from __future__ import annotations

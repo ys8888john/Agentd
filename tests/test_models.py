@@ -65,7 +65,11 @@ def test_model_dump_openai_shape():
         "name": None,
         "tool_calls": None,
         "tool_call_id": None,
+        "tool_record": None,
     }
+    # 发给 OpenAI 兼容端点时走 exclude_none=True（llm._with_system），
+    # None 字段不会出现在线格式里 —— 上面精确对比包含 None 键只是模型事实。
+    assert "tool_record" not in m.model_dump(exclude_none=True)
 
 
 # 工具调用字段（tool_calls / tool_call_id）

@@ -248,6 +248,12 @@ messages(seq, session_id, role, content, name, payload, created_at)
 存在的唯一理由是让人能用 `sqlite3` 直接看库、用 SQL 统计，而不是每次都写脚本解 JSON。
 将来给 `Message` 加字段也不用迁移表。
 
+除了 user / assistant 两种行，还有 `role="tool_record"`：每张完成的工具卡片一条
+（call_id/title/kind/status/output 全在 `payload.tool_record` 里，被拒绝的调用以
+`cancelled` 落库）。它是客户端历史回放用的 UI 记录 —— 内核加载 history 时会把
+这类行过滤掉，**永不进 LLM 上下文**；`role="tool"`（真正的工具结果消息）只存在于
+单轮执行过程里，不落库。
+
 ### 三个实现决定
 
 - **不用 aiosqlite。** 所有调用都经 `asyncio.to_thread` 丢进线程池，事件循环本来就不会

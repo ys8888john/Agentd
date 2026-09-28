@@ -597,9 +597,10 @@ async def test_kernel_tool_runs_against_session_cwd(tmp_path):
     done = [e for e in events if isinstance(e, ToolCallDone)]
     assert "only-here.txt" in done[0].output
 
-    # 工具往返是"本轮内的临时消息"，不落库：库里只有 user + 最终 assistant
+    # 工具卡片现在要落库（role="tool_record"，历史回放用）：库里是
+    # user + 工具记录 + 最终 assistant
     history = await kernel.history(session_id)
-    assert [m.role for m in history] == ["user", "assistant"]
+    assert [m.role for m in history] == ["user", "tool_record", "assistant"]
 
 
 async def test_kernel_approve_callback_is_used(tmp_path):
