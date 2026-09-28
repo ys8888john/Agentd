@@ -53,7 +53,9 @@ class AgentKernel:
         self.register(SingleMode())
         self.register(AgentMode())
 
-    def _make_toolbox(self, cwd: str | None) -> NativeToolbox | None:
+    def _make_toolbox(
+        self, cwd: str | None, additional_roots: list[Any] | None = None
+    ) -> NativeToolbox | None:
         """按会话 cwd 造一个原生工具箱；profile=off 或构造失败都返回 None。
 
         每个 run 造一个（而不是内核级共享）：cwd 是会话级的，
@@ -71,6 +73,7 @@ class AgentKernel:
         try:
             return NativeToolbox(
                 cwd=cwd,
+                additional_roots=additional_roots or [],
                 allow_outside=self.tools_allow_outside,
                 profile=profile,
                 max_bytes=self.tools_max_bytes,
@@ -99,7 +102,11 @@ class AgentKernel:
             raise UnknownModeError(name) from exc
 
     async def create_session(
-        self, *, cwd: str | None = None, mcp_servers: list[Any] | None = None
+        self,
+        *,
+        cwd: str | None = None,
+        mcp_servers: list[Any] | None = None,
+        additional_directories: list[Any] | None = None,
     ) -> str:
         session_id = new_session_id()
         await self.store.create(session_id)
@@ -107,11 +114,17 @@ class AgentKernel:
         self._session_opts[session_id] = {
             "cwd": cwd,
             "mcp_servers": list(mcp_servers or []),
+            "additional_directories": list(additional_directories or []),
         }
         return session_id
 
     async def adopt_session(
-        self, session_id: str, *, cwd: str | None = None, mcp_servers: list[Any] | None = None
+        self,
+        session_id: str,
+        *,
+        cwd: str | None = None,
+        mcp_servers: list[Any] | None = None,
+        additional_directories: list[Any] | None = None,
     ) -> bool:
         """给**已存在**的会话补上会话级配置 —— ACP session/load 的恢复路径。
 
@@ -124,7 +137,11 @@ class AgentKernel:
             return False
         self._session_opts.setdefault(
             session_id,
-            {"cwd": cwd, "mcp_servers": list(mcp_servers or [])},
+            {
+                "cwd": cwd,
+                "mcp_servers": list(mcp_servers or []),
+                "additional_directories": list(additional_directories or []),
+            },
         )
         return True
 
@@ -188,7 +205,9 @@ class AgentKernel:
                 system=self.system,
                 mcp_servers=opts.get("mcp_servers", []),
                 cwd=opts.get("cwd"),
-                toolbox=self._make_toolbox(opts.get("cwd")),
+                toolbox=self._make_toolbox(
+                    opts.get("cwd"), opts.get("additional_directories") or []
+                ),
                 approve=approve,
                 approval_policy=self.approval_policy,
                 cancel=cancel,

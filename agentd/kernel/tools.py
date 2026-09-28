@@ -93,6 +93,8 @@ class ToolRuntime:
 
     cwd: Path          # 相对路径的基准目录
     root: Path         # 允许访问的根，默认等于 cwd
+    # 额外允许访问的根（ACP additionalDirectories）：解析成绝对路径的元组
+    additional_roots: tuple[Path, ...] = ()
     allow_outside: bool = False
     max_bytes: int = 65536      # 单个工具返回文本的上限（防一口气灌爆上下文）
     timeout: float = 30.0       # run_command 默认超时（秒）
@@ -166,16 +168,20 @@ def _resolve(raw: str, rt: ToolRuntime) -> Path | None:
         return None
     if rt.allow_outside:
         return p
-    try:
-        p.relative_to(rt.root)
-    except ValueError:
-        return None
-    return p
+    # 会话 cwd 与 additionalDirectories 里声明的每个根都算"界内"；任何一个
+    # 命中即放行（相对路径天然落在 cwd 里，额外的根用绝对路径访问）。
+    for root in (rt.root, *rt.additional_roots):
+        try:
+            p.relative_to(root)
+            return p
+        except ValueError:
+            continue
+    return None  # 任何一个根都不含 → 越界（这句写错成 return p 就是安全洞）
 
 
 def _display(path: Path, rt: ToolRuntime) -> str:
     """喂给模型看的路径：优先相对，短且稳定。"""
-    for base in (rt.cwd, rt.root):
+    for base in (rt.cwd, rt.root, *rt.additional_roots):
         with contextlib.suppress(ValueError):
             return path.relative_to(base).as_posix()
     return path.as_posix()
@@ -949,6 +955,7 @@ class NativeToolbox:
         self,
         *,
         cwd: str | Path | None = None,
+        additional_roots: list[str | Path] | None = None,
         allow_outside: bool = False,
         profile: str = "native",
         max_bytes: int = 65536,
@@ -956,9 +963,18 @@ class NativeToolbox:
         max_results: int = 200,
     ) -> None:
         base = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
+        roots: list[Path] = []
+        for raw in additional_roots or []:
+            try:
+                p = Path(raw).expanduser().resolve()
+            except OSError:  # pragma: no cover
+                continue
+            if p != base and p not in roots:
+                roots.append(p)
         self.runtime = ToolRuntime(
             cwd=base,
             root=base,
+            additional_roots=tuple(roots),
             allow_outside=allow_outside,
             max_bytes=max_bytes,
             timeout=timeout,

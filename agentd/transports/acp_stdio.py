@@ -153,10 +153,14 @@ class AgentdAcpAgent(Agent):
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        session_id = await self._kernel.create_session(cwd=cwd, mcp_servers=mcp_servers)
+        session_id = await self._kernel.create_session(
+            cwd=cwd, mcp_servers=mcp_servers, additional_directories=additional_directories
+        )
         self._log(f"[agentd] 新会话 {session_id}  cwd={cwd}")
         if mcp_servers:
             self._log(f"[agentd] 本会话接入 {len(mcp_servers)} 个 MCP server")
+        if additional_directories:
+            self._log(f"[agentd] 额外工作区 {len(additional_directories)} 个：{additional_directories}")
         # 向客户端声明可用模式：session/set_mode 收到的 id 就是这里给的 id。
         # config_options 暂无可声明项，保持缺省（协议允许 None）。
         return NewSessionResponse(session_id=session_id, modes=self._modes_state())
@@ -178,6 +182,7 @@ class AgentdAcpAgent(Agent):
         self,
         session_id: str,
         cwd: str | None = None,
+        additional_directories: list[str] | None = None,
         mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse:
@@ -188,7 +193,10 @@ class AgentdAcpAgent(Agent):
         会话不存在时抛 ValueError，SDK 会转成 JSON-RPC error。
         """
         adopted = await self._kernel.adopt_session(
-            session_id, cwd=cwd, mcp_servers=list(mcp_servers or [])
+            session_id,
+            cwd=cwd,
+            mcp_servers=list(mcp_servers or []),
+            additional_directories=list(additional_directories or []),
         )
         if not adopted:
             raise ValueError(f"会话不存在：{session_id}")

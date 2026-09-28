@@ -169,8 +169,10 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 `write_file` / `edit` 的输出带 unified diff（行首 `--- / +++ / @@ / - / +`，
 上下文 2 行、超长截断），客户端据此在工具卡片里直接渲染改动前后对比。
 
-约束与限额：路径必须落在会话 cwd 内（`..` 会被 `resolve` 展开后再判，
-`AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；单次返回文本上限 64KB；
+约束与限额：路径必须落在会话 cwd 内，或客户端在 `session/new` /
+`session/load` 里声明的 `additionalDirectories`（额外工作区根）里
+（`..` 会被 `resolve` 展开后再判，`AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；
+单次返回文本上限 64KB；
 `run_command` 默认 30 秒超时、非零退出码按失败上报。
 
 **为什么不全走 MCP。** MCP 的 stdio 客户端内部是 anyio task group，
