@@ -128,6 +128,20 @@ AGENTD_LIVE_ZHIPU=1 AGENTD_ZHIPU_API_KEY=xxxx.yyyy pytest tests/test_zhipu_live.
 | `single` | 调一次 LLM 就结束。无工具的老行为。 |
 | `agent` | **默认**。工具循环：LLM → 若要调工具就执行 → 结果回灌 → 再调 LLM → 直到出纯文本（上限 12 步）。没有可用工具时与 `single` 等价。 |
 
+### 停止（中断）正在跑的一轮
+
+客户端可以随时发 ACP 的 `session/cancel` **通知**把这一轮停下来：
+
+- 传输层给每个进行中的 prompt 挂一个 `asyncio.Event`（SDK 每帧一个 task，
+  cancel 与 prompt 并发执行），内核和模式在**每个 chunk / 工具边界**上查看信号；
+- 流式输出最多推迟一个 chunk 生效；工具循环则是"没派发的批次不再派发"——
+  模型已经举手、但还没开始执行的调用直接跳过，不会出现"点了停止还在写文件"；
+- 审批同理：信号置位后，尚未等到答复的审批**一律按拒绝**处理；
+- 被停的一轮以 `stopReason="cancelled"` 收尾，**已流出的文本照常落库**
+  （一个字都没流出来时落一句"（已手动停止）"），续聊时上下文是完整的；
+- 中断粒度是 chunk/工具边界，不是掐死正在执行的子进程——`run_command`
+  有 `AGENTD_TOOLS_TIMEOUT` 超时兜底，MCP 调用同层。
+
 ## 工具：原生工具 + MCP
 
 agent 模式下的工具来自两条路，对模型完全透明（合并成一个 `tools` 数组，
@@ -339,6 +353,11 @@ firewall=false
 pip install -e ".[dev]"
 pytest -q
 ```
+
+取消（中断）的测试在 `tests/test_cancel.py`：single / agent 模式在流式中途、
+工具批次之间收到停止信号的行为（工具不执行、正文留"已流出的部分"、
+`cancelled` 收尾、历史照常落库），以及传输层 `cancel()` 与 `prompt()` 并发的
+往返（带节奏钩子的假 LLM 确定性触发，不起子进程）。
 
 MCP 工具循环的测试分三层：`AgentMode` 用假 Hub 测循环逻辑、`McpHub` 连真 stdio
 echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链路的真实验证

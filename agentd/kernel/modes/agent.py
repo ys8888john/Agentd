@@ -78,26 +78,46 @@ class AgentMode(Mode):
         async with McpHub(ctx.mcp_servers, cwd=ctx.cwd) as hub:
             tools = self._merged_schema(ctx, hub)
             last_text = ""
+            final_text = ""  # 收尾时定格的正文（正常走完=最后一步文本；被叫停=已流出的部分）
 
             for _ in range(MAX_STEPS):
+                if ctx.cancelled():
+                    final_text = "（已手动停止）"
+                    break
+
                 text_parts: list[str] = []
                 calls: list[LLMToolCall] = []
 
-                async for event in ctx.llm.stream_events(messages, system=ctx.system, tools=tools):
-                    if isinstance(event, LLMText):
-                        text_parts.append(event.text)
-                        yield MessageDelta(
-                            session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
-                        )
-                    elif isinstance(event, LLMThought):
-                        yield ThoughtDelta(
-                            session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
-                        )
-                    elif isinstance(event, LLMToolCall):
-                        calls.append(event)
+                stream = ctx.llm.stream_events(messages, system=ctx.system, tools=tools)
+                try:
+                    async for event in stream:
+                        if isinstance(event, LLMText):
+                            text_parts.append(event.text)
+                            yield MessageDelta(
+                                session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                            )
+                        elif isinstance(event, LLMThought):
+                            yield ThoughtDelta(
+                                session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                            )
+                        elif isinstance(event, LLMToolCall):
+                            calls.append(event)
+
+                        # 取消检查贴在每个事件后面：流式时一个 chunk 一查，停止请求
+                        # 最多推迟一个 chunk 生效。中途 break 要随即收掉底层 HTTP 流。
+                        if ctx.cancelled():
+                            break
+                finally:
+                    await stream.aclose()
 
                 text = "".join(text_parts)
                 last_text = text
+                final_text = text
+
+                if ctx.cancelled():
+                    # 流到一半被叫停：落一份"已流出的文本"当本轮回复，别让历史空着
+                    final_text = text or "（已手动停止）"
+                    break
 
                 if not calls:
                     yield MessageDone(session_id=ctx.session_id, run_id=ctx.run_id, text=text)
@@ -115,17 +135,23 @@ class AgentMode(Mode):
                 )
 
                 for call in calls:
+                    if ctx.cancelled():
+                        break
                     async for event in self._dispatch(ctx, hub, call):
                         if isinstance(event, Message):
                             messages.append(event)
                         else:
                             yield event
 
+                if ctx.cancelled():
+                    final_text = last_text or "（已手动停止）"
+                    break
+
             # 到上限还没收敛：把已有文本收尾，别把用户晾着
             yield MessageDone(
                 session_id=ctx.session_id,
                 run_id=ctx.run_id,
-                text=last_text or "（达到工具调用轮数上限）",
+                text=final_text or "（达到工具调用轮数上限）",
             )
 
     # ---- 工具来源合并 ----

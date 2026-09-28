@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any
 
@@ -93,6 +94,10 @@ class AgentdAcpAgent(Agent):
         self._conn: Any = None
         self._client_caps: Any = None
         self._session_modes: dict[str, str] = {}
+        # 会话 → 本次 prompt 的取消信号。cancel() 与 prompt() 由 SDK 分发到
+        # 各自的 task 上并发执行（acp/connection.py 是每帧一个 task），Event
+        # 就是为这种"一边跑一边叫停"准备的。轮次结束立即摘除，别留旧信号。
+        self._cancels: dict[str, asyncio.Event] = {}
         # 会话 → 已被"本会话总是允许"放行的工具名集合。
         # 审批记忆放在传输层而不是内核里：它是「客户端怎么问用户」的一部分，
         # 换个客户端（HTTP、TUI）记忆策略完全可以不一样，内核不该替它决定。
@@ -155,12 +160,23 @@ class AgentdAcpAgent(Agent):
         return None
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        """目前只记日志 —— 真正的中断要让内核在 handle() 里响应取消信号。"""
-        self._log(f"[agentd] 收到取消请求 session={session_id}（暂未实现中断）")
+        """把本会话正在跑的一轮标记为"该停了"。
+
+        协议上 session/cancel 是**通知**：不回帧、不等响应。真正的中断在内核里
+        发生 —— 停止信号沿着 chunk / 工具边界检查，当前这段 LLM 流或工具执行
+        走完就收尾（Done.stop_reason="cancelled"）。没有进行中的轮次时只记日志，
+        这是纯粹的 no-op，不是错误。
+        """
+        event = self._cancels.get(session_id)
+        if event is None:
+            self._log(f"[agentd] 收到取消请求 session={session_id}（当前没有进行中的轮次）")
+            return
+        event.set()
+        self._log(f"[agentd] 收到取消请求 session={session_id}，已标记中断")
 
     # ---- 审批 ----
 
-    def _make_approver(self, session_id: str) -> ApproveHandler:
+    def _make_approver(self, session_id: str, cancel: asyncio.Event | None = None) -> ApproveHandler:
         """造一个绑好 session 的审批回调，交给内核。
 
         踩过的坑：**客户端可能根本没实现 session/request_permission**（ACP 的
@@ -170,6 +186,11 @@ class AgentdAcpAgent(Agent):
         """
 
         async def approve(req: ApprovalRequest) -> bool:
+            if cancel is not None and cancel.is_set():
+                # 停止信号已在弹窗等人时到达：无论如何都不放行，工具循环会在
+                # 下一个边界收尾。别让"点了停止之后工具还在跑"变得可能。
+                self._log(f"[agentd] 已停止，跳过审批：{req.tool}")
+                return False
             granted = self._allow_all.setdefault(session_id, set())
             if req.tool in granted:
                 return True  # 之前选过"本会话总是允许"，不再打扰用户
@@ -215,61 +236,69 @@ class AgentdAcpAgent(Agent):
         await self._kernel.validate(session_id, mode)
 
         stop_reason = "end_turn"
+        cancel = asyncio.Event()
+        self._cancels[session_id] = cancel
 
-        async for event in self._kernel.handle(
-            session_id, text, mode=mode, approve=self._make_approver(session_id)
-        ):
-            if isinstance(event, MessageDelta):
-                await self._conn.session_update(
-                    session_id, update_agent_message_text(event.text)
-                )
+        try:
+            async for event in self._kernel.handle(
+                session_id, text, mode=mode, approve=self._make_approver(session_id, cancel), cancel=cancel
+            ):
+                if isinstance(event, MessageDelta):
+                    await self._conn.session_update(
+                        session_id, update_agent_message_text(event.text)
+                    )
 
-            elif isinstance(event, ThoughtDelta):
-                # ACP 有现成的 thought 通道（GUI 暗色渲染），推理模型的
-                # reasoning_content 走这里，不污染正文
-                await self._conn.session_update(
-                    session_id, update_agent_thought_text(event.text)
-                )
+                elif isinstance(event, ThoughtDelta):
+                    # ACP 有现成的 thought 通道（GUI 暗色渲染），推理模型的
+                    # reasoning_content 走这里，不污染正文
+                    await self._conn.session_update(
+                        session_id, update_agent_thought_text(event.text)
+                    )
 
-            elif isinstance(event, MessageDone):
-                # ACP 没有"整条消息"事件，客户端靠累积 chunk 自己拼。
-                # 我们多留一份 MessageDone 是给内核自己和未来的 HTTP 调试口用的。
-                pass
+                elif isinstance(event, MessageDone):
+                    # ACP 没有"整条消息"事件，客户端靠累积 chunk 自己拼。
+                    # 我们多留一份 MessageDone 是给内核自己和未来的 HTTP 调试口用的。
+                    pass
 
-            elif isinstance(event, ErrorEvent):
-                # 没有 error 这个 stop_reason，把错误内容送进 thought 通道，
-                # 客户端一般暗色渲染，用户能看到又不污染正文。
-                self._log(f"[agentd] 执行出错: {event.message}")
-                await self._conn.session_update(
-                    session_id, update_agent_thought_text(f"[错误] {event.message}")
-                )
+                elif isinstance(event, ErrorEvent):
+                    # 没有 error 这个 stop_reason，把错误内容送进 thought 通道，
+                    # 客户端一般暗色渲染，用户能看到又不污染正文。
+                    self._log(f"[agentd] 执行出错: {event.message}")
+                    await self._conn.session_update(
+                        session_id, update_agent_thought_text(f"[错误] {event.message}")
+                    )
 
-            elif isinstance(event, ToolCallStart):
-                await self._conn.session_update(
-                    session_id,
-                    start_tool_call(
-                        event.call_id,
-                        event.title,
-                        kind=_ACP_KIND.get(event.kind, "other"),
-                        status="in_progress",
-                    ),
-                )
+                elif isinstance(event, ToolCallStart):
+                    await self._conn.session_update(
+                        session_id,
+                        start_tool_call(
+                            event.call_id,
+                            event.title,
+                            kind=_ACP_KIND.get(event.kind, "other"),
+                            status="in_progress",
+                        ),
+                    )
 
-            elif isinstance(event, ToolCallDone):
-                await self._conn.session_update(
-                    session_id,
-                    update_tool_call(
-                        event.call_id,
-                        status=_ACP_STATUS.get(event.status, "completed"),
-                        raw_output=event.output,
-                    ),
-                )
+                elif isinstance(event, ToolCallDone):
+                    await self._conn.session_update(
+                        session_id,
+                        update_tool_call(
+                            event.call_id,
+                            status=_ACP_STATUS.get(event.status, "completed"),
+                            raw_output=event.output,
+                        ),
+                    )
 
-            elif isinstance(event, Done):
-                stop_reason = _STOP_REASON_MAP.get(event.stop_reason, "end_turn")
+                elif isinstance(event, Done):
+                    stop_reason = _STOP_REASON_MAP.get(event.stop_reason, "end_turn")
 
-            else:
-                self._log(f"[agentd] 暂未映射的事件类型: {event.type}")
+                else:
+                    self._log(f"[agentd] 暂未映射的事件类型: {event.type}")
+        finally:
+            # 无论如何都要摘信号：下一轮必须是干净的，旧轮次的 cancel 残留
+            # 会把（并发达到的）下一轮误停。
+            if self._cancels.get(session_id) is cancel:
+                self._cancels.pop(session_id, None)
 
         return PromptResponse(stop_reason=stop_reason)
 

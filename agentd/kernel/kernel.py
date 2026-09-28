@@ -128,6 +128,7 @@ class AgentKernel:
         *,
         mode: str = "single",
         approve: ApproveHandler | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         """执行一次对话，产出事件流。
 
@@ -136,6 +137,10 @@ class AgentKernel:
 
         `approve` 是审批回调（工具要写文件/跑命令时用），由传输层注入；
         不传等于"无人可问"，一律放行。
+        `cancel` 是可选的停止信号（asyncio.Event）：传输层收到 session/cancel 时
+        把它 set 上（SDK 每帧一个 task，这个 handler 能与本循环并发执行），内核和
+        模式在 chunk/工具边界查询、尽快收尾；本轮结束时 Done(stop_reason="cancelled")。
+        None = 本轮不可取消。
         """
 
         if not await self.store.exists(session_id):
@@ -162,6 +167,7 @@ class AgentKernel:
                 toolbox=self._make_toolbox(opts.get("cwd")),
                 approve=approve,
                 approval_policy=self.approval_policy,
+                cancel=cancel,
             )
 
             try:
@@ -177,4 +183,7 @@ class AgentKernel:
                 yield Done(session_id=session_id, run_id=run_id, stop_reason="error")
                 return
 
-            yield Done(session_id=session_id, run_id=run_id, stop_reason="end_turn")
+            # 被叫停的轮次必须把 cancelled 递到协议层（ACP 的 stop_reason 里有它），
+            # 客户端才能把界面从"生成中"收成"已停止"而不是"正常说完了"。
+            stop = "cancelled" if (cancel is not None and cancel.is_set()) else "end_turn"
+            yield Done(session_id=session_id, run_id=run_id, stop_reason=stop)

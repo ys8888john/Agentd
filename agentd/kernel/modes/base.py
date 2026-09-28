@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -42,7 +43,20 @@ class ModeContext:
     # 审批策略：native（默认，只拦原生写/执行类）| all（非只读全拦）| none（全放行）
     approval_policy: str = "native"
 
+    # 取消信号（asyncio.Event），由传输层造：一次 prompt 一个，收到 session/cancel
+    # 时被 set。内核与模式在循环边界上查询，尽快收尾；None = 本轮不可取消
+    # （TUI / 单测 / 老的 HTTP 调试口）。放 ModeContext 而不是 handle 参数逐层传，
+    # 理由同 approve：它是"这一轮怎么被外部叫停"的一部分，模式要能随手问。
+    cancel: asyncio.Event | None = None
+
+    def cancelled(self) -> bool:
+        """本轮被请求停止了吗。Event.is_set() 很便宜，可以贴在每个 chunk 旁边问。"""
+        return self.cancel is not None and self.cancel.is_set()
+
     async def request_approval(self, req: ApprovalRequest) -> bool:
+        if self.cancelled():
+            # 用户已经点了停止：审批（哪怕是弹窗里点了允许）也不用再走了
+            return False
         if self.approve is None:
             return True
         try:
