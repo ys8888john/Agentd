@@ -128,6 +128,10 @@ AGENTD_LIVE_ZHIPU=1 AGENTD_ZHIPU_API_KEY=xxxx.yyyy pytest tests/test_zhipu_live.
 | `single` | 调一次 LLM 就结束。无工具的老行为。 |
 | `agent` | **默认**。工具循环：LLM → 若要调工具就执行 → 结果回灌 → 再调 LLM → 直到出纯文本（上限 12 步）。没有可用工具时与 `single` 等价。 |
 
+这组模式已通过 ACP 的 session modes 对客户端声明（`session/new` 和
+`session/load` 的响应里带 `modes.currentModeId / availableModes`），
+`session/set_mode` 收到的 id 就是这里的 `single` / `agent`。
+
 ### 停止（中断）正在跑的一轮
 
 客户端可以随时发 ACP 的 `session/cancel` **通知**把这一轮停下来：
@@ -159,6 +163,9 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 | `run_command` | `execute` | **是** | 在工作目录跑 shell 命令，返回退出码 + stdout/stderr |
 | `web_search` | `search` | 否 | 用 Bing 搜网页，回"标题 + 直链 + 摘要"，`count` 上限 10 |
 | `web_fetch` | `fetch` | 否 | 抓一个 http(s) 页面，剥成纯文本（最多 2MB） |
+
+`write_file` / `edit` 的输出带 unified diff（行首 `--- / +++ / @@ / - / +`，
+上下文 2 行、超长截断），客户端据此在工具卡片里直接渲染改动前后对比。
 
 约束与限额：路径必须落在会话 cwd 内（`..` 会被 `resolve` 展开后再判，
 `AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；单次返回文本上限 64KB；
@@ -268,11 +275,13 @@ messages(seq, session_id, role, content, name, payload, created_at)
   会复用被删掉的 rowid，`clear()` 之后再 append，新消息的 seq 可能比老的小，
   `ORDER BY seq` 就把历史排乱了。
 
-### 还有一件事没做
+### 会话恢复（session/load）
 
-持久化只是**存下来**了，ACP 的 `new_session` 目前每次仍然造一个新会话，
-所以"关掉 GUI 再打开，接着上次聊"还差一步：客户端要把 session_id 记下来并在下次
-`new_session` 之后切回去。`list_sessions()` 已经备好了。
+客户端重启 / 断线重连后，可以带着 `sessionId` 调 ACP 的 `session/load`：
+历史、工具卡片记录都在库里，agentd 只把会话级配置（请求参数里的 `cwd`、
+`mcpServers`）重新绑上 —— 否则恢复出来的会话，工具会落在错误的目录。
+会话不存在时返回协议错误，不会悄悄新建。`session/new` / `session/load`
+的响应同时声明该会话的模式状态（见"模式"一节）。
 
 ### 为什么模型默认是 auto
 
@@ -364,6 +373,10 @@ pytest -q
 工具批次之间收到停止信号的行为（工具不执行、正文留"已流出的部分"、
 `cancelled` 收尾、历史照常落库），以及传输层 `cancel()` 与 `prompt()` 并发的
 往返（带节奏钩子的假 LLM 确定性触发，不起子进程）。
+
+`tests/test_session_load_and_diff.py` 锁 session/load 与 diff 输出：new/load
+声明的模式状态、load 后相对路径工具命中恢复的 cwd、不存在会话报错，
+以及 write_file/edit 输出里 diff 块的行首标记（前端着色的解析契约）。
 
 MCP 工具循环的测试分三层：`AgentMode` 用假 Hub 测循环逻辑、`McpHub` 连真 stdio
 echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链路的真实验证

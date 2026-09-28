@@ -110,6 +110,24 @@ class AgentKernel:
         }
         return session_id
 
+    async def adopt_session(
+        self, session_id: str, *, cwd: str | None = None, mcp_servers: list[Any] | None = None
+    ) -> bool:
+        """给**已存在**的会话补上会话级配置 —— ACP session/load 的恢复路径。
+
+        客户端重启后拿着旧 sessionId 来 load：历史还在库里，但工具的工作目录、
+        MCP 声明只存在于当初的 session/new 里，不重绑的话续聊的工具会在错误的
+        cwd 下执行。setdefault 语义：本进程已经 attach 过（new 过）的会话不被
+        覆盖；会话不存在返回 False，由传输层转成协议错误。
+        """
+        if not await self.store.exists(session_id):
+            return False
+        self._session_opts.setdefault(
+            session_id,
+            {"cwd": cwd, "mcp_servers": list(mcp_servers or [])},
+        )
+        return True
+
     async def history(self, session_id: str) -> list[Message]:
         return await self.store.history(session_id)
 

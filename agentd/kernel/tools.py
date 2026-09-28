@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import difflib
 import fnmatch
 import html
 import json
@@ -596,13 +597,21 @@ async def _write_file(args: dict, rt: ToolRuntime) -> str:
     if path is None:
         return err(_OUT_OF_ROOT.format(raw=raw, root=rt.root.as_posix()))
     existed = path.exists()
+    before = ""
+    if existed:
+        try:
+            before = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            before = ""  # 旧内容读不出来（二进制/权限）就不给 diff，照常写
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
     except OSError as exc:
         return err(f"写 {raw} 失败：{type(exc).__name__}: {exc}")
     action = "覆盖" if existed else "新建"
-    return f"已{action} {_display(path, rt)}（{len(content)} 字符，{content.count(chr(10)) + 1} 行）"
+    head = f"已{action} {_display(path, rt)}（{len(content)} 字符，{content.count(chr(10)) + 1} 行）"
+    diff = _diff_block(before, content, _display(path, rt))
+    return f"{head}\n{diff}" if diff else head
 
 
 async def _edit(args: dict, rt: ToolRuntime) -> str:
@@ -642,7 +651,33 @@ async def _edit(args: dict, rt: ToolRuntime) -> str:
         path.write_text(updated, encoding="utf-8")
     except OSError as exc:
         return err(f"写回 {raw} 失败：{type(exc).__name__}: {exc}")
-    return f"已修改 {_display(path, rt)}：替换 {count if replace_all else 1} 处"
+    head = f"已修改 {_display(path, rt)}：替换 {count if replace_all else 1} 处"
+    diff = _diff_block(text, updated, _display(path, rt))
+    return f"{head}\n{diff}" if diff else head
+
+
+def _diff_block(before: str, after: str, label: str, max_lines: int = 80) -> str:
+    """before/after 的 unified diff，给客户端的工具卡片当"改动前后对比"。
+
+    上下文 n=2：卡片里那么长的上下文没用；产出空 diff（内容没变）返回 ""，
+    调用方就不追加。超长截断 —— 64KB 的输出上限不该被一个大 diff 吃光。
+    行首标记（---/+++/@@/-/+）同时是前端 diff 着色的解析依据，别改名。
+    """
+    diff = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"{label}（旧）",
+            tofile=f"{label}（新）",
+            lineterm="",
+            n=2,
+        )
+    )
+    if not diff:
+        return ""
+    shown = diff[:max_lines]
+    tail = "" if len(diff) <= max_lines else f"\n…（diff 其余 {len(diff) - max_lines} 行略）"
+    return "\n".join(shown) + tail
 
 
 async def _run_command(args: dict, rt: ToolRuntime) -> str:

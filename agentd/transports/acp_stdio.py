@@ -19,6 +19,7 @@ from acp import (
     PROTOCOL_VERSION,
     Agent,
     InitializeResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
     start_tool_call,
@@ -27,7 +28,7 @@ from acp import (
     update_tool_call,
 )
 # PermissionOption / ToolCallUpdate 没在 acp 顶层导出，只能从 schema 取
-from acp.schema import PermissionOption, ToolCallUpdate
+from acp.schema import PermissionOption, SessionMode, SessionModeState, ToolCallUpdate
 
 from ..contracts import (
     Done,
@@ -80,6 +81,13 @@ _PERMISSION_OPTIONS = (
     PermissionOption(option_id="reject", name="拒绝", kind="reject_once"),
 )
 _ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session"})
+
+# 会话模式给客户端看的名字。id 与内核 Mode.name 严格一致（set_session_mode
+# 收到的就是它），name/description 是给人看的。
+_MODE_LABELS = {
+    "single": ("单次对话", "调一次 LLM 就结束，不调工具。"),
+    "agent": ("Agent（默认）", "工具循环：LLM ↔ 工具，直到给出纯文本。"),
+}
 
 
 class AgentdAcpAgent(Agent):
@@ -148,8 +156,44 @@ class AgentdAcpAgent(Agent):
         self._log(f"[agentd] 新会话 {session_id}  cwd={cwd}")
         if mcp_servers:
             self._log(f"[agentd] 本会话接入 {len(mcp_servers)} 个 MCP server")
-        # modes / config_options 也在这里声明 —— 等 C 方案落地时填上
-        return NewSessionResponse(session_id=session_id)
+        # 向客户端声明可用模式：session/set_mode 收到的 id 就是这里给的 id。
+        # config_options 暂无可声明项，保持缺省（协议允许 None）。
+        return NewSessionResponse(session_id=session_id, modes=self._modes_state())
+
+    def _modes_state(self, session_id: str | None = None) -> SessionModeState:
+        """当前模式状态的完整描述（new_session / load_session 复用）。"""
+        current = self._session_modes.get(session_id or "", "agent")
+        modes = self._kernel.modes()
+        available = []
+        for name in modes:
+            label, desc = _MODE_LABELS.get(name, (name, ""))
+            available.append(SessionMode(id=name, name=label, description=desc))
+        # current 不在可用列表里（异常状态）时回退 agent，别声明不存在的 current
+        if current not in modes:
+            current = "agent"
+        return SessionModeState(current_mode_id=current, available_modes=available)
+
+    async def load_session(
+        self,
+        session_id: str,
+        cwd: str | None = None,
+        mcp_servers: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> LoadSessionResponse:
+        """按 ACP 标准"恢复"一个历史会话（客户端重启 / 断线重连后调用）。
+
+        历史、工具卡片记录都在内核的 store 里；这里把会话级配置（cwd、
+        mcpServers —— 请求参数会把它们带回来）重新绑上，再声明模式状态。
+        会话不存在时抛 ValueError，SDK 会转成 JSON-RPC error。
+        """
+        adopted = await self._kernel.adopt_session(
+            session_id, cwd=cwd, mcp_servers=list(mcp_servers or [])
+        )
+        if not adopted:
+            raise ValueError(f"会话不存在：{session_id}")
+        self._session_modes.setdefault(session_id, "agent")
+        self._log(f"[agentd] 恢复会话 {session_id}  cwd={cwd}  MCP={len(mcp_servers or [])} 个")
+        return LoadSessionResponse(modes=self._modes_state(session_id))
 
     async def set_session_mode(
         self, session_id: str, mode_id: str, **kwargs: Any
