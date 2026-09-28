@@ -29,6 +29,7 @@ from acp import (
 )
 # PermissionOption / ToolCallUpdate 没在 acp 顶层导出，只能从 schema 取
 from acp.schema import PermissionOption, SessionMode, SessionModeState, ToolCallUpdate
+from acp.helpers import update_current_mode
 
 from ..contracts import (
     Done,
@@ -201,6 +202,14 @@ class AgentdAcpAgent(Agent):
         """记录该会话的模式覆盖值，下一次 prompt 时生效。"""
         self._session_modes[session_id] = mode_id
         self._log(f"[agentd] 会话 {session_id} 模式切换为 {mode_id}")
+        # 顺手广播标准 CurrentModeUpdate：所有在看这个会话的客户端（不止发起
+        # 切换的这个）都同步到新模式。通知失败不影响切换本身（连接坏了，
+        # 下一轮 prompt 会以更清楚的方式失败）。
+        if self._conn is not None:
+            try:
+                await self._conn.session_update(session_id, update_current_mode(mode_id))
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[agentd] 模式通知发送失败（忽略）：{type(exc).__name__}: {exc}")
         return None
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:

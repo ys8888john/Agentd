@@ -131,6 +131,8 @@ AGENTD_LIVE_ZHIPU=1 AGENTD_ZHIPU_API_KEY=xxxx.yyyy pytest tests/test_zhipu_live.
 这组模式已通过 ACP 的 session modes 对客户端声明（`session/new` 和
 `session/load` 的响应里带 `modes.currentModeId / availableModes`），
 `session/set_mode` 收到的 id 就是这里的 `single` / `agent`。
+切换成功后 agentd 会广播标准的 `current_mode_update` 通知 —— 所有在看这个
+会话的客户端同步到新模式，不依赖各自的轮询。
 
 ### 停止（中断）正在跑的一轮
 

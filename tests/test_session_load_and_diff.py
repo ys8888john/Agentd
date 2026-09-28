@@ -108,6 +108,33 @@ async def test_load_unknown_session_raises(tmp_path) -> None:
         raise AssertionError("不存在的会话应该抛错，而不是悄悄新建")
 
 
+class _RecordConn:
+    """带记录的 conn 占位：验证 set_session_mode 的标准通知广播。"""
+
+    def __init__(self) -> None:
+        self.updates: list = []
+
+    async def session_update(self, session_id, update) -> None:
+        self.updates.append((session_id, update))
+
+
+async def test_set_mode_broadcasts_current_mode_update(tmp_path) -> None:
+    """切模式随发一条标准 current_mode_update —— 多端同步的协议闭环。"""
+    kernel = AgentKernel(llm=PlayLLM([]), store=InMemorySessionStore())
+    sid = await kernel.create_session(cwd=str(tmp_path))
+    agent = AgentdAcpAgent(kernel)
+    conn = _RecordConn()
+    agent.on_connect(conn)
+
+    await agent.set_session_mode(sid, "single")
+
+    assert any(
+        getattr(u, "session_update", "") == "current_mode_update"
+        and getattr(u, "current_mode_id", None) == "single"
+        for _, u in conn.updates
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2) 工具输出的 diff 块
 # ---------------------------------------------------------------------------
