@@ -36,14 +36,13 @@ def _call(name: str, args: dict) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _no_zhipu_search(monkeypatch):
+def _no_zhipu_search(no_live_credentials):
     """这几条测试的目的是验证「Bing/搜狗结果页长这样」的假设没失效。
 
-    智谱 API 上线后成为首选后端，会把 Bing/搜狗整段跳过 —— 所以这里必须
-    把 key 剥掉，逼工具走回抓 HTML 的老路。
+    智谱 API 上线后成为首选后端，会把 Bing/搜狗整段跳过 —— 所以必须把 key 剥掉，
+    逼工具走回抓 HTML 的老路。光 delenv 不够：key 还会从仓库 .env 里被读进来
+    （见 no_live_credentials）。
     """
-    monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
-    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
 
 
 def test_live_search_returns_real_results():

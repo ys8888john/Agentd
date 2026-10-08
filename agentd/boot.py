@@ -442,11 +442,11 @@ def _read_hotenv() -> dict[str, str]:
     }
 
 
-def current_settings() -> Settings:
-    """当前生效的配置，供热加载后端每轮读取。
+def _live_val() -> Callable[[str, str], str]:
+    """构造"当前生效配置"的取数函数（优先级见 current_settings 文档）。
 
-    优先级（逐档回落）：
-        RUNTIME_CONFIG.overrides  >  GUI 热配置文件  >  启动时的真实环境变量  >  重新解析的 .env  >  默认
+    单独抽出来是因为**进程内原生工具也要按同一套优先级取配置**（见 env_value）——
+    配置有几档来源，取数规则就只能有一份，散成两处迟早对不上。
     """
     dotenv = _read_dotenv_fresh()
     initial = _INITIAL_ENV
@@ -461,7 +461,28 @@ def current_settings() -> Settings:
             return initial[name]
         return dotenv.get(name, default)
 
-    return _build_settings(val)
+    return val
+
+
+def env_value(name: str, default: str = "") -> str:
+    """按与 current_settings **完全相同**的优先级，取一个环境变量的生效值。
+
+    给进程内的原生工具用（典型：web_search 的智谱后端要读 provider key）。
+    不能用 ``os.getenv`` 顶替：GUI 切模型/provider 时，key 是写进热配置文件
+    （``AGENTD_HOTENV`` 指向的 JSON）、只进 current_settings、**不进 os.environ**
+    —— 裸读 os.getenv 只会拿到空串，症状是"LLM 明明在用这个 key，工具却说自己
+    没配"，而且不报错、只是静默降级，极难自查（2026-10-08 智谱搜索不生效即此因）。
+    """
+    return _live_val()(name, default)
+
+
+def current_settings() -> Settings:
+    """当前生效的配置，供热加载后端每轮读取。
+
+    优先级（逐档回落）：
+        RUNTIME_CONFIG.overrides  >  GUI 热配置文件  >  启动时的真实环境变量  >  重新解析的 .env  >  默认
+    """
+    return _build_settings(_live_val())
 
 
 class LiveLLM(LLM):

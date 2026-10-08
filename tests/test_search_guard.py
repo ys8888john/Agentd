@@ -24,6 +24,18 @@ from agentd.kernel.tools import (
 from pathlib import Path
 
 
+# ---- 智谱 key 来源隔离 ----
+# key 的取数链 = overrides > 热配置文件 > 启动环境变量 > .env > 默认。任何一层漏进来
+# 的值都会让"没配 key 应跳过智谱"这类用例失去意义：本仓库 .env 里就躺着真 key，而
+# _INITIAL_ENV 是 agentd.boot **首次 import 时**的 os.environ 快照 —— 哪个用例先给
+# os.environ 塞了 test-key，快照就被永久污染（用例顺序一变结果就变）。统一在这里清干净。
+
+@pytest.fixture(autouse=True)
+def _isolate_zhipu_config(no_live_credentials):
+    """每个用例都从"哪儿都没配 key"起步，自己按需 setenv（见 conftest）。"""
+    yield
+
+
 # ---- 缓存 ----
 
 def test_search_cache_roundtrip_and_ttl(monkeypatch):
@@ -212,8 +224,53 @@ def test_zhipu_failure_falls_through_with_reason(monkeypatch):
     assert "搜狗也不可用" in out
 
 
+def _write_hotenv(tmp_path, values: dict):
+    """写一份 GUI 风格的热配置文件，测试里用 AGENTD_HOTENV 指过去即可。"""
+    p = tmp_path / "hotenv.json"
+    p.write_text(json.dumps(values), encoding="utf-8")
+    return p
+
+
+def test_zhipu_key_read_from_hotenv_file(monkeypatch, tmp_path):
+    """回归（2026-10-08 事故）：key 只在热配置文件里、不在 os.environ 也必须被读到。
+
+    根因：boot 的 hotenv 只喂 current_settings（LLM 用），不写 os.environ；而
+    tools 裸 os.getenv → 空串 → 智谱后端被静默跳过，一路落到 Bing/搜狗。
+    """
+    monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    hot = _write_hotenv(tmp_path, {"AGENTD_ZHIPU_API_KEY": "hot-key-123"})
+    monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+
+    assert tools_mod._zhipu_search_key() == "hot-key-123"
+
+
+def test_web_search_uses_hotenv_zhipu_key(monkeypatch, tmp_path):
+    """GUI 真实路径：key 只在 hotenv.json → web_search 仍应命中智谱首选后端。"""
+    async def run():
+        server, url, state = await _start_fake_api()
+        async with server:
+            monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
+            monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+            hot = _write_hotenv(tmp_path, {"AGENTD_ZHIPU_API_KEY": "hot-key"})
+            monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+            monkeypatch.setenv("AGENTD_ZHIPU_SEARCH_ENDPOINT", url)
+            monkeypatch.delenv("AGENTD_SEARCH_ENDPOINT", raising=False)
+            box = NativeToolbox(cwd=Path.cwd(), profile="native")
+            out = await box.call("web_search", json.dumps({"query": "成都到北京航班", "count": 5}))
+        return out, state
+
+    out, state = asyncio.run(run())
+    assert "来源：智谱搜索 API" in out, out
+    assert "3U8881" in out
+    assert state["requests"] == 1  # 只打智谱，Bing/搜狗没被碰
+
+
 def test_no_zhipu_key_skips_backend_entirely(monkeypatch):
-    """没配智谱 key：智谱连请求都不该发，直接走 Bing（行为与旧版一致）。"""
+    """没配智谱 key：智谱连请求都不该发，直接走 Bing（行为与旧版一致）。
+
+    所有配置来源的隔离由模块级 _isolate_zhipu_config fixture 负责。
+    """
     async def run():
         server, url, state = await _start_fake_api()
         async with server:

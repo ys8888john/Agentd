@@ -640,6 +640,97 @@ async def test_agent_mode_unknown_tool_still_closes_the_card(tmp_path):
     assert done[0].status == "failed" and "未知工具" in done[0].output
 
 
+# --- 方案③：非只读 MCP 工具也走审批（不再只信服务端 destructiveHint） ---
+
+
+class _McpBinding:
+    def __init__(self, read_only: bool):
+        self.tool = "tool"
+        self.read_only = read_only
+
+    async def call(self, name, args):  # pragma: no cover - 被拒/只读分支用不到
+        return "ok"
+
+
+def _mcp_hub_factory(target: str, readonly: bool):
+    """返回一个可被 McpHub 替换的类：命中 target 的返回带 read_only 的 binding。"""
+
+    class _Hub:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def binding(self, name):
+            return _McpBinding(read_only=readonly) if name == target else None
+
+        def tool_schema(self):
+            return []
+
+        async def call(self, name, args):
+            return "ok"
+
+    return _Hub
+
+
+async def test_mcp_execute_tool_requires_approval(tmp_path):
+    """非只读 MCP 工具（如 browser 开页）必须弹审批，被拒就不执行。"""
+    llm = ScriptedLLM(
+        [
+            [LLMToolCall(id="c1", name="browser__open_url", arguments='{"url":"https://example.com"}')],
+            [LLMText("好")],
+        ]
+    )
+    seen: list[ApprovalRequest] = []
+
+    async def deny(req: ApprovalRequest) -> bool:
+        seen.append(req)
+        return False
+
+    import agentd.kernel.modes.agent as agent_mod
+
+    original = agent_mod.McpHub
+    agent_mod.McpHub = _mcp_hub_factory("browser__open_url", readonly=False)
+    try:
+        events = [e async for e in AgentMode().run(_ctx(tmp_path, llm, approve=deny), "hi")]
+    finally:
+        agent_mod.McpHub = original
+
+    assert [r.tool for r in seen] == ["browser__open_url"]
+    assert seen[0].kind == "execute"
+    done = [e for e in events if isinstance(e, ToolCallDone)]
+    assert done[0].status == "cancelled"
+
+
+async def test_mcp_readonly_tool_skips_approval(tmp_path):
+    """只读 MCP 工具（read_only_hint=True）不弹审批，直接执行。"""
+    llm = ScriptedLLM(
+        [
+            [LLMToolCall(id="c1", name="time__now", arguments="{}")],
+            [LLMText("好")],
+        ]
+    )
+
+    async def boom(req: ApprovalRequest) -> bool:
+        raise AssertionError("只读 MCP 工具不该触发审批")
+
+    import agentd.kernel.modes.agent as agent_mod
+
+    original = agent_mod.McpHub
+    agent_mod.McpHub = _mcp_hub_factory("time__now", readonly=True)
+    try:
+        events = [e async for e in AgentMode().run(_ctx(tmp_path, llm, approve=boom), "hi")]
+    finally:
+        agent_mod.McpHub = original
+
+    done = [e for e in events if isinstance(e, ToolCallDone)]
+    assert done[0].status == "completed"
+
+
 async def test_approval_exception_is_treated_as_refusal(tmp_path):
     """审批通道坏了必须往"拒绝"倒 —— 反过来就是安全漏洞。"""
     llm = ScriptedLLM(
@@ -1052,15 +1143,17 @@ def _bypass_sandbox_proxy(monkeypatch):
     monkeypatch.setenv("no_proxy", "*")
 
 
-def test_web_search_reports_connection_failure(monkeypatch):
+def test_web_search_reports_connection_failure(monkeypatch, no_live_credentials):
     """连不上时必须回 [错误] 前缀（AgentMode 靠它把卡片标成 failed），而不是抛异常。
 
     指向 127.0.0.1:9 是刻意的：本地必然立刻拒绝，不产生任何外网流量。
-    Bing 和搜狗两个后端都要指过去 —— 主后端挂了会去试备用，只堵一个的话
-    这条测试会真连外网搜狗，既离线不了、结果也随网络波动。
+    三个后端都要指过去 —— 主后端挂了会去试备用，只堵一个的话这条测试会真连外网，
+    既离线不了、结果也随网络波动。智谱那层光堵端点不够：仓库 .env 里有真 key，
+    必须靠 no_live_credentials 把 key 剥干净，否则真 key 在场时智谱会直接返回结果。
     """
     import agentd.kernel.tools as tools_mod
 
+    monkeypatch.setenv("AGENTD_ZHIPU_SEARCH_ENDPOINT", "http://127.0.0.1:9/zhipu")
     _bypass_sandbox_proxy(monkeypatch)
     monkeypatch.setattr(tools_mod, "_SEARCH_ENDPOINT", "http://127.0.0.1:9/search")
     monkeypatch.setattr(tools_mod, "_SOGOU_ENDPOINT", "http://127.0.0.1:9/web")

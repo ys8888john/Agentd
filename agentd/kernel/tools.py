@@ -602,8 +602,22 @@ _ZHIPU_SEARCH_ENGINE = "search_pro_sogou"  # 备选：search_std / search_pro / 
 
 
 def _zhipu_search_key() -> str:
-    """智谱 key：与 boot.py 的 LLM 后端同一套来源，不新增配置项。"""
-    return os.getenv("AGENTD_ZHIPU_API_KEY", "") or os.getenv("ZHIPU_API_KEY", "")
+    """智谱 key：与 boot.py 的 LLM 后端同一套来源，不新增配置项。
+
+    必须走 boot.env_value 而不是裸 os.getenv —— GUI 切模型时 key 写在热配置文件
+    （AGENTD_HOTENV 指向的 JSON）里，那份配置只进 current_settings、**不进
+    os.environ**。裸读会得到空串，于是"LLM 用的就是这把 key、web_search 却说没配"，
+    静默回落 Bing/搜狗（2026-10-08 事故）。这里延迟导入 boot：boot 依赖 kernel，
+    顶层 import 会成环。
+    """
+    key = ""
+    try:
+        from ..boot import env_value
+
+        key = env_value("AGENTD_ZHIPU_API_KEY", "")
+    except Exception:  # noqa: BLE001 - 取不到就当没配，回落 Bing/搜狗，绝不因此报错
+        key = ""
+    return key or os.getenv("AGENTD_ZHIPU_API_KEY", "") or os.getenv("ZHIPU_API_KEY", "")
 
 
 def _zhipu_search_endpoint() -> str:
@@ -1431,9 +1445,11 @@ def needs_approval(*, requires: bool, kind: str, destructive: bool, policy: str)
 
     - `none`  —— 一律放行（CI / 无人值守用）
     - `all`   —— 只要不是只读就弹审批
-    - `native`（默认）—— 原生工具按各自声明的 requires；MCP 工具只看 destructiveHint
-      （MCP 协议没有 kind 概念，能拿到的信号只有 annotations 里那几个 hint，
-       所以对 MCP 只信它自己声明的 destructive，不替它猜）
+    - `native`（默认）—— 原生工具按各自声明的 requires；MCP 工具看 kind：
+      `_mcp_kind` 把 `read_only_hint=True` 的归为 read（放行），
+      其余 execute 一律 require（不再只信服务端的 destructiveHint）。
+      这样 browser / 写库 / 执行类 MCP 工具都会在动手前弹审批，
+      而只读 / 搜索 / 获取类工具不打扰用户。
 
     只读动作（read / search / fetch）在任何策略下都不弹 —— 每个 ls 都弹窗，用户三分钟
     就会学会无脑点"允许"，审批本身也就废了。

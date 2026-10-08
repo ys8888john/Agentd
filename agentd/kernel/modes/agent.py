@@ -208,7 +208,11 @@ class AgentMode(Mode):
         elif mcp is not None:
             title = mcp.tool
             kind = _mcp_kind(mcp)
-            requires = False
+            # 非只读的 MCP 工具也走审批：不再只信服务端的 destructiveHint。
+            # 只读（read_only_hint=True → kind="read"）继续放行；
+            # 其余 execute（browser 开页 / sqlite 写 / git 提交 / memory 写…）一律
+            # require，让用户在"动真格"之前确认。policy=all/none 仍由 needs_approval 兜底。
+            requires = kind != "read"
             destructive = bool(getattr(mcp, "destructive", None))
         else:
             # 名字没对上任何来源：不执行，但要走完 start/done 让客户端把卡片收掉
