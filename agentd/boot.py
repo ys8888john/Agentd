@@ -419,7 +419,7 @@ def _read_hotenv() -> dict[str, str]:
     文件；运行中的 agentd 每轮对话重新读它，于是**下一轮即用、无需重启子进程**。
 
     路径取环境变量 ``AGENTD_HOTENV``（GUI 启动 agentd 时设好，指向它自己管理的
-    ``~/.forgeagent/hotenv.json``）；缺省回落到 ``~/.agentd/hotenv.json``
+    ``~/.agentd/gui/hotenv.json``）；缺省回落到 ``~/.agentd/hotenv.json``
     （非 GUI 场景，一般不存在 = 等于没有热覆盖）。
 
     文件缺失 / 损坏 / 非 dict 一律返回空 dict —— 等于"没有热覆盖"，回落到下一档

@@ -180,7 +180,7 @@ provider 在**下一轮对话**即生效，不用重启进程。
 
 1. **GUI 热配置文件**（ForgeAgent-GUI 切模型专用，**不重启 agentd**）：GUI 切换
    provider / 模型时，把选中的 profile 环境变量写进一个 JSON 文件，路径由启动时的
-   `AGENTD_HOTENV` 环境变量指定（GUI 默认指向它自己管理的 `~/.forgeagent/hotenv.json`；
+   `AGENTD_HOTENV` 环境变量指定（GUI 默认指向它自己管理的 `~/.agentd/gui/hotenv.json`；
    非 GUI 场景缺省回落 `~/.agentd/hotenv.json`）。`current_settings()` 每轮都读它，于是
    **运行中的 agentd 下一轮即用，子进程完全不用重启**——会话历史 / 工具循环 / 已加载的
    MCP 全都不用重建。这是前端「会话中随时切模型」的主通道。
