@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
@@ -36,6 +37,50 @@ from .base import Mode, ModeContext
 
 # 工具循环上限：防模型来回调不停（每次循环至少一次 LLM 调用）。
 MAX_STEPS = 12
+
+# 到上限时给用户兜底的正文。**不能用最后一步的文本** —— 那通常是模型准备调下一个
+# 工具的过场话（"让我尝试从另一个来源获取…"），拿它当答复就是"没给答案就中断"
+# （2026-10-08 实测 sess_65a0584cc8f94dd6：12 轮全烧在反复 web_search/web_fetch 上，
+# 最后一条停在"让我尝试从另一个来源获取更详细的航班信息"，用户看到的就是这个）。
+_LOOP_LIMIT_NOTE = (
+    "（已达到本轮工具调用上限 {n} 步，未能收敛出完整结论。）\n\n"
+    "上面已完成的搜索/抓取结果仍然有效，可以据此参考。若要继续，请直接回复"
+    "「继续」，我会接着往下做。"
+)
+
+
+def _fallback_text(last_text: str) -> str:
+    """工具循环耗尽时的收尾正文。
+
+    优先用**非过场**的最后一段文本：只有当它不像"我准备再调一次工具"的台词时
+    才用它（例如模型已经写出了一段小结）。否则退回 `_LOOP_LIMIT_NOTE` ——
+    与其把一句"让我再试一个来源"当答案交给用户，不如老实说"到上限了，可以继续"。
+    """
+    text = (last_text or "").strip()
+    if text and not _looks_like_preamble(text):
+        return text
+    return _LOOP_LIMIT_NOTE.format(n=MAX_STEPS)
+
+
+# 过场话的判据：很短、且以"让我/我再/接下来我/下面我"这类**打算做什么**的措辞
+# 开头，或者以冒号结尾（"让我试试这样："）。宁可漏判也不能误判 —— 把真正的小结
+# 判成过场话会让用户丢掉已有的结论。
+_PREAMBLE_HEAD_RX = re.compile(
+    r"^\s*(?:让我|我再|接下来|下面我|我准备|我将|现在让我|先让我)"
+)
+_PREAMBLE_TAIL = ("：", ":", "…", "...", "，", ",")
+
+
+def _looks_like_preamble(text: str | None) -> bool:
+    """这段文本是不是"准备再调一次工具"的过场话（而非给用户的答复）。"""
+    if not text:
+        return False
+    if len(text) > 120:
+        # 写得长，多半已经在给结论了；宁可留着
+        return False
+    if text.endswith(_PREAMBLE_TAIL):
+        return True
+    return bool(_PREAMBLE_HEAD_RX.match(text))
 
 # 审批弹窗里给用户看的一行摘要：按这个顺序取第一个非空的字符串参数。
 _DETAIL_KEYS = ("command", "path", "pattern")
@@ -81,10 +126,12 @@ class AgentMode(Mode):
             tools = self._merged_schema(ctx, hub)
             last_text = ""
             final_text = ""  # 收尾时定格的正文（正常走完=最后一步文本；被叫停=已流出的部分）
+            stopped = False  # 本轮是被人叫停的，还是撞到步数上限的 —— 收尾话术不同
 
             for _ in range(MAX_STEPS):
                 if ctx.cancelled():
                     final_text = "（已手动停止）"
+                    stopped = True
                     break
 
                 text_parts: list[str] = []
@@ -124,6 +171,7 @@ class AgentMode(Mode):
                 if ctx.cancelled():
                     # 流到一半被叫停：落一份"已流出的文本"当本轮回复，别让历史空着
                     final_text = text or "（已手动停止）"
+                    stopped = True
                     break
 
                 if not calls:
@@ -158,13 +206,21 @@ class AgentMode(Mode):
 
                 if ctx.cancelled():
                     final_text = last_text or "（已手动停止）"
+                    stopped = True
                     break
 
-            # 到上限还没收敛：把已有文本收尾，别把用户晾着
+            # 到上限还没收敛：把已有文本收尾，别把用户晾着。
+            # 注意用 _fallback_text：last_text 常常只是"让我换个来源"的过场话，
+            # 直接当答复就是"没给答案就突然中断"。
+            # 被叫停时不套这段话术 —— 那不是"到上限"，用户自己按的停。
+            if stopped:
+                closing = final_text or last_text
+            else:
+                closing = _fallback_text(final_text or last_text)
             yield MessageDone(
                 session_id=ctx.session_id,
                 run_id=ctx.run_id,
-                text=final_text or "（达到工具调用轮数上限）",
+                text=closing,
             )
 
     # ---- 工具来源合并 ----

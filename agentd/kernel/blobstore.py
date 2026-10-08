@@ -42,11 +42,21 @@ PREVIEW_CHARS = 2048
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def tool_results_root(home: Path | None = None) -> Path:
+    """外置结果的总目录。`externalize` 和内核的路径白名单共用这一个定义 ——
+    两边各写一份的话，改了一处就会让"提示可读"和"实际允许读"对不上。"""
+    return (home or (Path.home() / ".agentd")) / "tool_results"
+
+
 def externalize(output: str, session_id: str, call_id: str, *, home: Path | None = None) -> str:
     """超阈值时把全文落盘并返回 <persisted-output> 包装；小结果原样返回。
 
     包装格式刻意与 WorkBuddy 一致（<persisted-output> 标签）：模型见过这个
     形状，知道「要全文就按路径读文件」。
+
+    ⚠️ 落盘位置在 ~/.agentd/tool_results/ 下、**工作目录之外**，所以内核必须
+    把该目录登记进工具箱的 additional_roots（见 AgentKernel._tool_roots），
+    否则上面那句"用 read_file 读"会直接被路径守卫拒掉。
     """
     size_bytes = len(output.encode("utf-8"))
     if size_bytes <= THRESHOLD_BYTES:
@@ -54,7 +64,7 @@ def externalize(output: str, session_id: str, call_id: str, *, home: Path | None
 
     sid = _SAFE.sub("_", session_id)[:80] or "session"
     cid = _SAFE.sub("_", call_id)[:80] or "call"
-    base = (home or (Path.home() / ".agentd")) / "tool_results" / sid
+    base = tool_results_root(home) / sid
     base.mkdir(parents=True, exist_ok=True)
     path = base / f"{cid}.txt"
     path.write_text(output, encoding="utf-8")

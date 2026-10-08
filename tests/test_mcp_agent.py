@@ -115,6 +115,123 @@ async def test_agent_mode_no_tools_behaves_like_single(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 1b) 工具循环耗尽（MAX_STEPS）时的收尾正文
+#
+# 2026-10-08 实测事故（sess_65a0584cc8f94dd6）：模型 12 步全烧在反复
+# web_search / web_fetch 上，最后停在"让我尝试从另一个来源获取更详细的航班信息"，
+# 用户看到的是「没给答案就突然中断」。
+# ---------------------------------------------------------------------------
+
+
+class _AlwaysCallsLLM:
+    """每一步都只要调工具 —— 用来把 MAX_STEPS 耗光。"""
+
+    def __init__(self, preamble: str) -> None:
+        self.preamble = preamble
+        self.calls = 0
+
+    async def stream_events(self, messages, *, system=None, tools=None):
+        self.calls += 1
+        yield LLMText(self.preamble)
+        yield LLMToolCall(id=f"c{self.calls}", name="echo__echo", arguments="{}")
+
+
+async def test_agent_mode_hitting_step_limit_does_not_answer_with_preamble(monkeypatch):
+    """耗尽循环时不能把"让我再试一个来源"当过场话交给用户。"""
+    import agentd.kernel.modes.agent as agent_mod
+    from agentd.kernel.modes.agent import MAX_STEPS
+
+    monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
+
+    llm = _AlwaysCallsLLM("让我尝试从另一个来源获取更详细的信息：")
+    ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
+    events = [e async for e in AgentMode().run(ctx, "hi")]
+
+    assert llm.calls == MAX_STEPS, "应当正好烧满上限"
+    done = events[-1]
+    assert isinstance(done, MessageDone)
+    # 关键断言：不能是那句过场话
+    assert done.text != "让我尝试从另一个来源获取更详细的信息："
+    assert "让我尝试" not in done.text
+    # 要说清发生了什么、并给出下一步
+    assert str(MAX_STEPS) in done.text
+    assert "继续" in done.text
+
+
+async def test_agent_mode_keeps_real_conclusion_at_step_limit(monkeypatch):
+    """最后一步已经写出结论（不像过场话）时必须原样保留，不能被兜底文案盖掉。"""
+    import agentd.kernel.modes.agent as agent_mod
+    from agentd.kernel.modes.agent import MAX_STEPS
+
+    monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
+
+    llm = _AlwaysCallsLLM("已为你整理好 3 个航班，详见上表。")
+    ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
+    events = [e async for e in AgentMode().run(ctx, "hi")]
+
+    assert llm.calls == MAX_STEPS
+    assert events[-1].text == "已为你整理好 3 个航班，详见上表。"
+
+
+async def test_agent_mode_cancel_keeps_streamed_text(monkeypatch):
+    """中途被叫停：保留已流出的正文，不能套上"到达步数上限"的话术。
+
+    这两件事原因完全不同 —— 用户自己按的停，不该被告知"这一轮没跑完"。
+    """
+    import asyncio
+
+    import agentd.kernel.modes.agent as agent_mod
+    from agentd.kernel.modes.agent import MAX_STEPS
+
+    monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
+
+    cancel = asyncio.Event()
+
+    class _StopMidStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_events(self, messages, *, system=None, tools=None):
+            self.calls += 1
+            yield LLMText("让我")
+            cancel.set()  # 用户在这一刻点了停止
+            yield LLMToolCall(id=f"c{self.calls}", name="echo__echo", arguments="{}")
+
+    llm = _StopMidStream()
+    ctx = ModeContext(
+        session_id="s", run_id="r", llm=llm, history=[Message.user("hi")], cancel=cancel
+    )
+    events = [e async for e in AgentMode().run(ctx, "hi")]
+
+    assert llm.calls < MAX_STEPS, "叫停了就不该再烧到上限"
+    done = events[-1]
+    assert isinstance(done, MessageDone)
+    assert done.text == "让我"
+    assert "上限" not in done.text
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("让我尝试从另一个来源获取更详细的航班信息：", True),
+        ("我再试一个来源", True),
+        ("接下来我会先读取文件", True),
+        ("我准备换一个搜索词", True),
+        ("下面我分三步来做：", True),
+        ("已为你整理好 28 个航班，见下表。", False),
+        ("", False),
+        (None, False),
+        # 写得长 → 判断为已在给结论，不能误判成过场话丢掉用户已有的结果
+        ("让我说明一下：" + "详" * 200, False),
+    ],
+)
+def test_looks_like_preamble_matrix(text, expected):
+    from agentd.kernel.modes.agent import _looks_like_preamble
+
+    assert _looks_like_preamble(text) is expected
+
+
+# ---------------------------------------------------------------------------
 # 2) McpHub 连真 server
 # ---------------------------------------------------------------------------
 

@@ -16,9 +16,12 @@ import pytest
 
 from agentd.kernel import blobstore
 from agentd.kernel.blobstore import externalize
+from agentd.kernel.kernel import AgentKernel
+from agentd.kernel.llm import LLM
 from agentd.kernel.models import Message
 from agentd.kernel.modes.agent import AgentMode
 from agentd.kernel.modes.base import ModeContext
+from agentd.kernel.store import InMemorySessionStore
 
 
 # ---- 纯函数 ----
@@ -121,3 +124,85 @@ async def test_agent_mode_externalizes_big_tool_result(tmp_path, monkeypatch):
     spilled = list(tmp_path.rglob("call_big_1.txt"))
     assert len(spilled) == 1
     assert len(spilled[0].read_text(encoding="utf-8")) == 5000
+
+
+# ---- 外置目录必须在工具的路径白名单里 ----
+#
+# 2026-10-08 实测事故（sess_65a0584cc8f94dd6 seq=479）：web_fetch 大输出被外置到
+# ~/.agentd/tool_results/…，包装里写着"要全文就用 read_file 读上面的路径"，
+# 但那个路径在工作目录之外 → read_file 直接回「路径越界」，模型照着提示读必然失败。
+# 提示与守卫必须对齐：blobstore 落哪，工具箱就得允许读哪。
+
+
+class _NullLLM(LLM):
+    """占位 LLM：本段用例只验证工具箱的根目录，不真的跑一轮对话。"""
+
+    async def stream_events(self, messages, *, system=None, tools=None):
+        return
+        yield  # pragma: no cover  —— 让这仍是生成器函数
+
+
+def _kernel() -> AgentKernel:
+    return AgentKernel(llm=_NullLLM(), store=InMemorySessionStore())
+
+
+def test_tool_results_root_matches_externalize_location(tmp_path, monkeypatch):
+    """`tool_results_root` 与实际落盘位置必须同源，不能各写一份。"""
+    from agentd.kernel.blobstore import tool_results_root
+
+    monkeypatch.setattr(blobstore, "THRESHOLD_BYTES", 10)
+    externalize("x" * 1000, "sess_a", "call_b", home=tmp_path)
+    spilled = list(tmp_path.rglob("call_b.txt"))
+    assert len(spilled) == 1
+    # 落盘文件就在 tool_results_root(home)/<session>/ 下
+    assert spilled[0].parent.parent == tool_results_root(home=tmp_path)
+
+
+def test_kernel_registers_tool_results_dir_as_a_readable_root(tmp_path, monkeypatch):
+    """内核必须把 tool_results 目录加进工具箱的根，否则"要全文就 read_file"是死胡同。"""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    kernel = _kernel()
+    roots = kernel._tool_roots(None)
+    from agentd.kernel.blobstore import tool_results_root
+
+    assert tool_results_root() in roots
+
+
+def test_kernel_keeps_client_supplied_roots_alongside_blob_dir(tmp_path, monkeypatch):
+    """客户端显式给的 additionalDirectories 不能被顶掉。"""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    kernel = _kernel()
+    extra = tmp_path / "proj"
+    extra.mkdir()
+    roots = kernel._tool_roots([extra])
+    from agentd.kernel.blobstore import tool_results_root
+
+    assert extra in roots and tool_results_root() in roots
+
+
+def test_blob_dir_is_actually_readable_through_the_toolbox(tmp_path, monkeypatch):
+    """端到端：外置后按包装里给的路径 read_file，必须真的读得到全文。
+
+    这条是事故的直接回归 —— 以前这一步会返回「路径越界」。
+    """
+    import asyncio
+    import json as _json
+
+    from agentd.kernel.tools import NativeToolbox
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(blobstore, "THRESHOLD_BYTES", 10)
+
+    body = "正文" * 500
+    # 不带 home=：走真实链路（Path.home()/.agentd/…），与内核注册的根同源
+    wrapped = externalize(body, "sess_r", "call_r")
+    # 包装里给的路径（externalize 用的是绝对路径）
+    path = next(p for p in wrapped.splitlines() if str(tmp_path) in p)
+    path = path.split("：", 1)[1].strip()
+
+    (tmp_path / "work").mkdir(exist_ok=True)
+    kernel = _kernel()
+    tb = NativeToolbox(cwd=tmp_path / "work", additional_roots=kernel._tool_roots(None))
+    out = asyncio.run(tb.call("read_file", _json.dumps({"path": path})))
+    assert not out.startswith("[错误]"), out
+    assert "正文" in out

@@ -23,6 +23,7 @@ from ..contracts import (
     new_run_id,
     new_session_id,
 )
+from .blobstore import tool_results_root
 from .llm import LLM
 from .context import (
     BEHAVIOR_GUIDE,
@@ -124,6 +125,25 @@ class AgentKernel:
                 flush=True,
             )
             return None
+
+    def _tool_roots(self, extra: list[Any] | None) -> list[Any]:
+        """本会话可访问的根目录 = 客户端给的 additionalDirectories + 工具结果目录。
+
+        **必须把 tool_results 目录算进来**：大输出会被 blobstore 外置到
+        `~/.agentd/tool_results/<session>/`，并且提示模型"要全文就用 read_file
+        读上面的路径" —— 而那个路径天然在工作目录之外。不放进白名单的话，
+        这句提示就是个死胡同：模型照着读只会拿到「路径越界」（2026-10-08 实测
+        sess_65a0584cc8f94dd6 seq=479 就是这么卡住的，白烧掉一步）。
+        """
+        roots: list[Any] = list(extra or [])
+        blob_root = tool_results_root()
+        try:
+            blob_root.mkdir(parents=True, exist_ok=True)
+        except OSError:  # pragma: no cover - 目录建不出来就别加，不能因此让整轮挂掉
+            return roots
+        if blob_root not in roots:
+            roots.append(blob_root)
+        return roots
 
     def _system_prompt(self, opts: dict[str, Any], memory: str = "") -> str | None:
         """本轮真正要用的 system prompt = 用户写的 + 运行时说明。
@@ -459,7 +479,8 @@ class AgentKernel:
 
             opts = self._session_opts.get(session_id, {})
             toolbox = self._make_toolbox(
-                opts.get("cwd"), opts.get("additional_directories") or []
+                opts.get("cwd"),
+                self._tool_roots(opts.get("additional_directories")),
             )
             # 工具 schema 也占窗口（放着二十几个 MCP 工具的 schema 不是小数），
             # 所以触发线要把它算进去。MCP 的工具要连上 server 才知道有哪些，
