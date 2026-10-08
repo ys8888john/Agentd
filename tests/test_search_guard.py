@@ -1,23 +1,27 @@
-"""搜索缓存 / 搜狗节流熔断 / 实体反转义 测试。
+"""搜索缓存 / 搜狗节流熔断 / 实体反转义 / 智谱首选后端 测试。
 
 背景（2026-10-08 事故二）：模型一轮对同一 query 连打 6 次 web_search，快速
 连打第 2 次起搜狗就弹验证码，兜底整段失效 —— 修法是缓存 + 节流 + 熔断。
+智谱搜索 API 上线为首选后端（key 在场时），Bing/搜狗降为兜底。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
 
 import agentd.kernel.tools as tools_mod
 from agentd.kernel.tools import (
+    NativeToolbox,
     _parse_sogou,
     _search_cache_get,
     _search_cache_put,
     _search_sogou,
 )
+from pathlib import Path
 
 
 # ---- 缓存 ----
@@ -118,3 +122,91 @@ def test_parse_sogou_unescapes_entities():
     assert results[0]["title"] == "标题&测试"
     assert "&amp;" not in results[0]["url"]
     assert "amp" not in results[0]["snippet"] or "&" in results[0]["snippet"]
+
+
+# ---- 智谱搜索 API（首选后端）----
+
+@pytest.fixture(autouse=True)
+def _clean_search_state():
+    tools_mod._search_cache.clear()
+    yield
+    tools_mod._search_cache.clear()
+
+
+async def _start_fake_api(payload: dict | None = None, status: int = 200):
+    """本地假智谱 web_search API：记录请求次数，返回固定 JSON。"""
+    state = {"requests": 0}
+    body = json.dumps(payload if payload is not None else {
+        "search_result": [
+            {"title": "智谱结果一", "link": "https://example.com/z1",
+             "content": "成都到北京航班号 3U8881 11:30 起飞", "media": "Example"},
+            {"title": "智谱结果二", "link": "https://example.com/z2",
+             "content": "国航 CA4115 每日一班", "media": "Example"},
+        ]
+    }).encode()
+
+    async def handle(reader, writer):
+        state["requests"] += 1
+        # 先把请求读完再应答：Windows 上没读就关会触发 RST，客户端报 ReadError
+        while True:
+            line = await reader.readline()
+            if not line or line == b"\r\n":
+                break
+        writer.write(
+            b"HTTP/1.1 %d OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+            % (status, len(body))
+        )
+        writer.write(body)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, f"http://127.0.0.1:{port}/v4/web_search", state
+
+
+def test_zhipu_is_primary_backend(monkeypatch):
+    """key 在场时智谱必须是首选：结果带「来源：智谱搜索 API」，且不碰 Bing/搜狗。"""
+    async def run():
+        server, url, state = await _start_fake_api()
+        async with server:
+            monkeypatch.setenv("AGENTD_ZHIPU_API_KEY", "test-key")
+            monkeypatch.setenv("AGENTD_ZHIPU_SEARCH_ENDPOINT", url)
+            monkeypatch.delenv("AGENTD_SEARCH_ENDPOINT", raising=False)
+            box = NativeToolbox(cwd=Path.cwd(), profile="native")
+            out = await box.call("web_search", json.dumps({"query": "成都到北京航班", "count": 5}))
+        return out, state
+
+    out, state = asyncio.run(run())
+    assert "来源：智谱搜索 API" in out
+    assert "智谱结果一" in out
+    assert "3U8881" in out
+    assert state["requests"] == 1  # 只打了假 API，Bing/搜狗没被碰
+
+
+def test_zhipu_failure_falls_through_with_reason(monkeypatch):
+    """智谱挂了（HTTP 401）→ 落到 Bing/搜狗，且失败原因透出在最终错误里。"""
+    async def run():
+        server, url, state = await _start_fake_api(status=401)
+        async with server:
+            monkeypatch.setenv("AGENTD_ZHIPU_API_KEY", "test-key")
+            monkeypatch.setenv("AGENTD_ZHIPU_SEARCH_ENDPOINT", url)
+            monkeypatch.delenv("AGENTD_SEARCH_ENDPOINT", raising=False)
+            monkeypatch.setenv("AGENTD_SOGOU_ENDPOINT", "http://127.0.0.1:9/web")
+            # Bing 也指向不可达地址：整条链路都离线，断言错误信息里三层原因齐全
+            monkeypatch.setenv("AGENTD_SEARCH_ENDPOINT", "")  # 空串=没设，但需真连 Bing → 改为直接断言智谱失败后回落
+            box = NativeToolbox(cwd=Path.cwd(), profile="native")
+            # 为了不碰真网：把 Bing 整个替换掉
+            async def fake_bing(query, limit):
+                raise tools_mod._SearchError("Bing 不可达（假）")
+            monkeypatch.setattr(tools_mod, "_search_bing", fake_bing)
+            tools_mod._sogou_state = {"last_request": 0.0, "cooldown_until": 0.0}
+            out = await box.call("web_search", json.dumps({"query": "q", "count": 5}))
+        return out, state
+
+    out, _state = asyncio.run(run())
+    assert out.startswith("[错误]"), out
+    assert "智谱搜索不可用" in out
+    assert "Bing 不可达（假）" in out
+    assert "搜狗也不可用" in out

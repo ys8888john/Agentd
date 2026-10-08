@@ -35,6 +35,17 @@ def _call(name: str, args: dict) -> str:
     return asyncio.run(box.call(name, json.dumps(args)))
 
 
+@pytest.fixture(autouse=True)
+def _no_zhipu_search(monkeypatch):
+    """这几条测试的目的是验证「Bing/搜狗结果页长这样」的假设没失效。
+
+    智谱 API 上线后成为首选后端，会把 Bing/搜狗整段跳过 —— 所以这里必须
+    把 key 剥掉，逼工具走回抓 HTML 的老路。
+    """
+    monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+
+
 def test_live_search_returns_real_results():
     """真打一次 Bing，必须解析出带 URL 的条目（顺带打出来给人看）。"""
     out = _call("web_search", {"query": "python asyncio", "count": 3})

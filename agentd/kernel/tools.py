@@ -590,6 +590,81 @@ async def _search_bing(query: str, limit: int) -> tuple[list[dict], str]:
     return results, count_hint
 
 
+# ---- 智谱搜索 API（首选后端，2026-10-08）----
+# 背景：Bing 对票务/出行类 query 一律降级成只搜第一个词（改不了），搜狗有
+# 验证码反爬（连打必中）。而用户跑 zhipu 后端时手里本来就有智谱 API key ——
+# 智谱开放平台的 web_search API 就是服务端搜索（元宝同款技术栈），返回的
+# 是处理过的结构化结果：不降级、不反爬、摘要里直接带航班号/时刻这类干货。
+# 实测 search_pro_sogou 一次能回 50 条，质量吊打抓 HTML 的两条路。
+# 所以 key 在场时智谱做**首选**，Bing/搜狗降为兜底；没 key 时行为与旧版一致。
+_ZHIPU_SEARCH_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/web_search"
+_ZHIPU_SEARCH_ENGINE = "search_pro_sogou"  # 备选：search_std / search_pro / search_pro_quark
+
+
+def _zhipu_search_key() -> str:
+    """智谱 key：与 boot.py 的 LLM 后端同一套来源，不新增配置项。"""
+    return os.getenv("AGENTD_ZHIPU_API_KEY", "") or os.getenv("ZHIPU_API_KEY", "")
+
+
+def _zhipu_search_endpoint() -> str:
+    """智谱搜索地址，AGENTD_ZHIPU_SEARCH_ENDPOINT 可覆盖（离线单测用）。"""
+    return os.getenv("AGENTD_ZHIPU_SEARCH_ENDPOINT") or _ZHIPU_SEARCH_ENDPOINT
+
+
+async def _search_zhipu(query: str, limit: int) -> tuple[list[dict], str]:
+    """智谱 web_search API：返回 (结果, "")；任何失败抛 _SearchError。
+
+    响应形状：{"search_result": [{"title", "link", "content", "media"}, ...]}。
+    search_pro_sogou 引擎会无视 count 回一大串，这里自己切到 limit。
+    摘要（content）往往比 HTML 页的 snippet 长得多，截到 280 字符，
+    既保住干货又不让单条结果把上下文灌爆。
+    """
+    key = _zhipu_search_key()
+    if not key:
+        raise _SearchError("未配置 AGENTD_ZHIPU_API_KEY")
+    engine = os.getenv("AGENTD_ZHIPU_SEARCH_ENGINE") or _ZHIPU_SEARCH_ENGINE
+    payload = {"search_engine": engine, "search_query": query, "count": limit}
+    try:
+        async with httpx.AsyncClient(
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            follow_redirects=True,
+            timeout=_WEB_TIMEOUT,
+        ) as client:
+            resp = await client.post(_zhipu_search_endpoint(), json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:200]
+        raise _SearchError(f"HTTP {exc.response.status_code}: {body}") from exc
+    except httpx.HTTPError as exc:
+        raise _SearchError(f"{type(exc).__name__}: {exc}") from exc
+    except ValueError as exc:
+        raise _SearchError(f"响应不是 JSON：{exc}") from exc
+
+    items = data.get("search_result") or []
+    results = []
+    for it in items:
+        title = str(it.get("title") or "").strip()
+        url = str(it.get("link") or "").strip()
+        if not title or not url:
+            continue
+        snippet = " ".join(str(it.get("content") or "").split())
+        if len(snippet) > 280:
+            snippet = snippet[:280] + "…"
+        media = str(it.get("media") or "").strip()
+        if media and media not in title:
+            title = f"{title}（{media}）"
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= limit:
+            break
+    if not results:
+        raise _SearchError(f"API 返回 0 条（engine={engine}，keys={list(data)[:6]}）")
+    return results, ""
+
+
 async def _search_sogou(query: str, limit: int) -> tuple[list[dict], str]:
     """搜狗备用后端：返回 (结果, "")；任何失败抛 _SearchError。
 
@@ -658,6 +733,22 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
 
     bing: tuple[list[dict], str] | None = None
     bing_err = ""
+    zhipu_note = ""
+
+    # 首选：智谱搜索 API（key 在场且非自定义后端时）。抓 HTML 的两条路
+    # （Bing 降级 / 搜狗验证码）都是下策，API 是上策；失败才依次落到它们。
+    if not custom_backend and _zhipu_search_key():
+        try:
+            zhipu = await _search_zhipu(query, limit)
+            if zhipu[0] and not _looks_degraded(query, zhipu[0]):
+                out = _format_search_results(
+                    query, zhipu[0], "", rt.max_bytes, "来源：智谱搜索 API")
+                _search_cache_put(cache_key, out)
+                return out
+            zhipu_note = "智谱返回 0 条或与 query 不相关"
+        except _SearchError as exc:
+            zhipu_note = f"智谱搜索不可用（{exc}）"
+
     try:
         bing = await _search_bing(query, limit)
     except _SearchError as exc:
@@ -669,23 +760,25 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
             _search_cache_put(cache_key, out)
         return out
 
-    # 走到这：Bing 失败，或结果答非所问（仅默认后端）→ 搜狗兜底
+    # 走到这：智谱/Bing 都没给出可用结果 → 搜狗兜底
     if custom_backend:
         return err(f"web_search 失败：{bing_err}")
 
-    sogou_note = ""
+    sogou_note = zhipu_note
     try:
         sogou = await _search_sogou(query, limit)
         if sogou[0]:
             reason = ("Bing 返回的结果与 query 不相关（被降级）" if bing is not None
                       else f"Bing 不可用（{bing_err}）")
+            if zhipu_note:
+                reason = f"{zhipu_note}；{reason}"
             out = _format_search_results(
                 query, sogou[0], "", rt.max_bytes, f"来源：搜狗（{reason}）")
             _search_cache_put(cache_key, out)
             return out
-        sogou_note = "搜狗没解析出条目"
+        sogou_note = f"{zhipu_note}；搜狗没解析出条目" if zhipu_note else "搜狗没解析出条目"
     except _SearchError as exc:
-        sogou_note = f"搜狗也不可用（{exc}）"
+        sogou_note = f"{zhipu_note}；搜狗也不可用（{exc}）" if zhipu_note else f"搜狗也不可用（{exc}）"
 
     if bing is not None:
         # Bing 被降级但搜狗没顶上：结果给出去但明说不可靠，并且把搜狗失败的
