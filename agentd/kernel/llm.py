@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import uuid
@@ -37,6 +38,48 @@ def _log(msg: str) -> None:
 
 class LLMError(RuntimeError):
     """LLM 调用失败（网络/协议/模型错误）统一成这个异常。"""
+
+
+# ---- 云端过载自动重试 ----
+#
+# 2026-10-09 实测：智谱高峰期回 HTTP 429 + {"code":"1305","message":"该模型当前
+# 访问量过大，请您稍后再试"}，以前第一次就把错误抛给用户 —— 但"稍后再试"这件事
+# 是纯体力活，该交给程序。默认重试 5 次、递增等待（过载不会几秒内缓解，前密后疏）。
+#
+# Ollama 不接这套：它是本机服务，不存在平台限流。
+RATE_LIMIT_RETRIES = 5
+RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)  # 总计约 59s，够一次过载高峰过去
+# 值得重试的状态码：408 请求超时、429 限流、5xx 网关/过载。
+# 401/403/404 是配置错误（key 不对、模型名不存在），重试到天荒地老也不会好，
+# 必须立刻抛给用户。
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class _AttemptFailed(LLMError):
+    """单次尝试失败的中间层异常：多带一个 HTTP 状态码供重试判断。
+
+    它是 LLMError 的子类 —— 重试耗尽后原样抛出，上层看到的消息一字不差。
+    status=0 表示"HTTP 层面是 200，错误藏在 body 里"（部分网关这么干），
+    此时按 body 内容判断是否过载（见 _body_error_is_overload）。
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _body_error_is_overload(detail: str) -> bool:
+    """200 状态但 body 里带 error 对象时，按内容判断是不是"过载/限流"类错误。
+
+    各家的码不一样（智谱 1305/1302、OpenAI 系 rate_limit_error），码表维护不动，
+    抓消息里的稳定关键词 + 已知的智谱码就够了。宁可漏判（不重试直接报错），
+    不要误判 —— 对"余额不足""内容审查"这类错误重试 5 次纯属浪费用户时间。
+    """
+    head = detail[:200]
+    return any(
+        k in head
+        for k in ("1305", "1302", "访问量过大", "稍后再试", "rate limit", "Rate limit", "overloaded")
+    )
 
 
 @dataclass
@@ -409,59 +452,94 @@ class OpenAICompatLLM(LLM):
         *,
         system: str | None = None,
         tools: list[dict] | None = None,
-    ) -> AsyncIterator[LLMText | LLMToolCall]:
+    ) -> AsyncIterator[LLMText | LLMToolCall | LLMThought | LLMNotice]:
         model = await self.resolve_model()
         headers = {"Authorization": f"Bearer {self.api_key}"}
         # 工具调用在 SSE 里按 index **增量拼接**：先来 id/name，arguments 分片渐次到达。
         # 用一个 dict 累积，流结束时再一次性吐出去（见函数末尾）。
-        pending: dict[int, dict[str, str]] = {}
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url}/chat/completions",
-                    json=self._payload(messages, system, model, tools),
-                    headers=headers,
-                ) as resp:
-                    if resp.status_code >= 400:
-                        detail = (await resp.aread()).decode("utf-8", "replace").strip()
-                        raise LLMError(
-                            f"OpenAI 兼容端点 HTTP {resp.status_code}："
-                            f"{detail[:300] or '（空响应体）'}（当前模型 {model}）"
-                        )
-                    # 兼容端点是 SSE（逐行 `data: {...}`），遇 [DONE] 收尾
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-                        obj = json.loads(data)
-                        if obj.get("error"):
-                            raise LLMError(str(obj["error"]))
-                        delta = (obj.get("choices") or [{}])[0].get("delta") or {}
-                        # GLM-4.5 / MiMo / DeepSeek 系推理模型的思考挂在
-                        # reasoning_content：分轨直播，绝不混进正文
-                        reasoning = delta.get("reasoning_content") or ""
-                        if reasoning:
-                            yield LLMThought(reasoning)
-                        text = delta.get("content") or ""
-                        if text:
-                            yield LLMText(text)
-                        for call in delta.get("tool_calls") or []:
-                            idx = call.get("index", 0)
-                            slot = pending.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                            if call.get("id"):
-                                slot["id"] = call["id"]
-                            fn = call.get("function") or {}
-                            if fn.get("name"):
-                                slot["name"] = fn["name"]
-                            if fn.get("arguments"):
-                                slot["arguments"] += fn["arguments"]
-        except httpx.ConnectError as exc:
-            raise LLMError(f"连不上 {self.base_url}：{exc}") from exc
-        except httpx.TimeoutException as exc:
-            raise LLMError(f"OpenAI 兼容端点请求超时：{exc}") from exc
+        #
+        # 过载重试：只在**一个字都没吐过**时才允许重来。流已经开始后再失败，
+        # 重发会把已输出的内容重复一遍 —— 比报错更糟，所以 yielded 一旦为 True，
+        # 任何异常都直接抛。每次尝试各自开一个连接：429 是响应头就判定的，
+        # 根本没读到流，复用连接没有意义。
+        for attempt in range(RATE_LIMIT_RETRIES + 1):  # 首次 + 5 次重试
+            pending: dict[int, dict[str, str]] = {}
+            yielded = False
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        json=self._payload(messages, system, model, tools),
+                        headers=headers,
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            detail = (await resp.aread()).decode("utf-8", "replace").strip()
+                            raise _AttemptFailed(
+                                resp.status_code,
+                                f"OpenAI 兼容端点 HTTP {resp.status_code}："
+                                f"{detail[:300] or '（空响应体）'}（当前模型 {model}）",
+                            )
+                        # 兼容端点是 SSE（逐行 `data: {...}`），遇 [DONE] 收尾
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[len("data:"):].strip()
+                            if data == "[DONE]":
+                                break
+                            obj = json.loads(data)
+                            if obj.get("error"):
+                                # 200 状态但 body 带错误：是不是过载按内容判断
+                                # （智谱高峰偶发这种形态），过载才值得重试。
+                                detail = str(obj["error"])
+                                status = 429 if _body_error_is_overload(detail) else 0
+                                raise _AttemptFailed(status, detail)
+                            delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                            # GLM-4.5 / MiMo / DeepSeek 系推理模型的思考挂在
+                            # reasoning_content：分轨直播，绝不混进正文
+                            reasoning = delta.get("reasoning_content") or ""
+                            if reasoning:
+                                yielded = True
+                                yield LLMThought(reasoning)
+                            text = delta.get("content") or ""
+                            if text:
+                                yielded = True
+                                yield LLMText(text)
+                            for call in delta.get("tool_calls") or []:
+                                idx = call.get("index", 0)
+                                slot = pending.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                                if call.get("id"):
+                                    slot["id"] = call["id"]
+                                fn = call.get("function") or {}
+                                if fn.get("name"):
+                                    slot["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    slot["arguments"] += fn["arguments"]
+            except _AttemptFailed as exc:
+                if (
+                    not yielded
+                    and attempt < RATE_LIMIT_RETRIES
+                    and exc.status in RETRYABLE_STATUS
+                ):
+                    delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                    _log(
+                        f"[agentd] LLM 过载（HTTP {exc.status}），"
+                        f"{delay:.0f}s 后第 {attempt + 1}/{RATE_LIMIT_RETRIES} 次重试"
+                    )
+                    # 走 Notice 通道：不进正文、不落库，GUI 会显示成思考框里的一行
+                    yield LLMNotice(
+                        f"模型繁忙（HTTP {exc.status}），{delay:.0f}s 后自动重试"
+                        f"（第 {attempt + 1}/{RATE_LIMIT_RETRIES} 次）…"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except httpx.ConnectError as exc:
+                raise LLMError(f"连不上 {self.base_url}：{exc}") from exc
+            except httpx.TimeoutException as exc:
+                raise LLMError(f"OpenAI 兼容端点请求超时：{exc}") from exc
+            else:
+                break  # 这一次尝试完整走完（[DONE] 正常收尾），不再重试
 
         for idx in sorted(pending):
             slot = pending[idx]
