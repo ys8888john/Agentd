@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from agentd.kernel.context import BEHAVIOR_GUIDE
 from agentd.kernel.kernel import AgentKernel
 from agentd.kernel.llm import LLM, LLMText
 from agentd.kernel.memory import (
@@ -349,7 +350,11 @@ async def _say(kernel: AgentKernel, sid: str, text: str) -> None:
 
 async def test_memory_is_off_when_summary_every_is_zero(tmp_path):
     """summary_every=0 必须把读和压一起关掉 —— 半开关（还在往 system 里塞旧摘要）
-    比全关更难解释。"""
+    比全关更难解释。
+
+    注意：system 不再是 None —— 行为规范是恒在的（见 BEHAVIOR_GUIDE）。
+    这里要断言的是"没有任何**记忆**漏进来"，不是"system 为空"。
+    """
     llm = RecorderLLM()
     kernel = _kernel(llm, summary_every=0, memory_file=tmp_path / "m.md")
     sid = await kernel.create_session()
@@ -358,7 +363,8 @@ async def test_memory_is_off_when_summary_every_is_zero(tmp_path):
         await _say(kernel, sid, f"第{i}句")
 
     assert llm.compacts == 0
-    assert llm.systems == [None] * 10  # system 里一点记忆都没有
+    # 只有固定那一段规范，末尾没有追加记忆块（记忆块以"关于用户"起头，见 render_memory_block）
+    assert all((s or "") == BEHAVIOR_GUIDE for s in llm.systems)
 
 
 async def test_summary_is_written_once_the_session_is_long_enough(tmp_path):
@@ -440,3 +446,15 @@ async def test_facts_reach_the_system_prompt(tmp_path):
     await _say(kernel, sid, "你好")
 
     assert "偏好简体中文" in (llm.systems[-1] or "")
+
+
+async def test_behavior_guide_always_reaches_the_system_prompt(tmp_path):
+    """规范是恒在的：即使用户没写 system prompt、也没开记忆，它也在。"""
+    llm = RecorderLLM()
+    kernel = _kernel(llm, summary_every=20)
+    sid = await kernel.create_session()
+    await _say(kernel, sid, "你好")
+
+    system = llm.systems[-1] or ""
+    assert "【行为规范】" in system
+    assert "不要写进正文" in system

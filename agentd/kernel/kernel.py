@@ -25,6 +25,7 @@ from ..contracts import (
 )
 from .llm import LLM
 from .context import (
+    BEHAVIOR_GUIDE,
     DEFAULT_COMPACT_RATIO,
     CompactPlan,
     Pressure,
@@ -127,7 +128,9 @@ class AgentKernel:
     def _system_prompt(self, opts: dict[str, Any], memory: str = "") -> str | None:
         """本轮真正要用的 system prompt = 用户写的 + 运行时说明。
 
-        运行时说明目前有两类 source（将来的还可以继续往 sections 里加）：
+        运行时说明目前有三类 source（将来的还可以继续往 sections 里加）：
+        0. 行为规范（BEHAVIOR_GUIDE，见 context.py）—— 恒在，钉住"怎么说话、
+           怎么交付"：过程性自言自语不进正文、用户点名要的格式必须照做；
         1. 工作目录长什么样（见 tools.workspace_brief）—— 没有它，模型开局不知道
            自己站在哪个目录、有哪些文件，第一轮常常浪费在探路上，或者直接猜错
            文件名；
@@ -142,7 +145,10 @@ class AgentKernel:
         （create_session 写一次），把每轮都变的记忆文本塞进去，等于让读取
         者分不清"这是配置还是临时产物"。
         """
-        sections: list[str] = [memory]
+        # 行为规范恒在、且排在最前（紧跟用户 system prompt 之后）：它是"怎么说话
+        # 怎么交付"的硬约束，比工作目录、记忆这些"背景资料"优先级更高 —— 排在
+        # 前面模型更不容易在长上下文里把它冲淡。
+        sections: list[str] = [BEHAVIOR_GUIDE, memory]
         if self.native_tools in TOOL_PROFILES and TOOL_PROFILES[self.native_tools]:
             cwd = opts.get("cwd")
             if cwd:

@@ -11,7 +11,9 @@ import pytest
 
 from agentd.boot import LiveLLM, Settings, _build_settings, build_llm
 from agentd.kernel.context import (
+    BEHAVIOR_GUIDE,
     NO_TRIM,
+    compose_system,
     describe_compact,
     describe_trim,
     estimate_message_tokens,
@@ -306,6 +308,28 @@ def test_describe_compact_explains_what_happened():
     assert "7" in ok
     assert str(plan.pressure.budget) in ok
     assert "没能产出摘要" in bad
+
+
+def test_behavior_guide_pins_the_two_hard_rules():
+    """行为规范必须钉住两条最常踩的规则：过程台词不进正文、点名格式要照做。"""
+    assert "不要写进正文" in BEHAVIOR_GUIDE
+    assert "列表" in BEHAVIOR_GUIDE and "表格" in BEHAVIOR_GUIDE
+    # 短提示才值得每轮都付：超过一屏就说明它在做"行为手册"，不是钉约束
+    assert len(BEHAVIOR_GUIDE) < 400
+
+
+def test_compose_system_puts_guide_right_after_user_prompt():
+    """规范排在用户 prompt 之后、记忆之前 —— 越靠前越不容易被长上下文冲淡。"""
+    composed = compose_system("你是助手。", [BEHAVIOR_GUIDE, "记忆：用户喜欢中文"])
+    assert composed is not None
+    assert composed.index("你是助手。") < composed.index("【行为规范】")
+    assert composed.index("【行为规范】") < composed.index("记忆：用户喜欢中文")
+
+
+def test_compose_system_skips_empty_guide_slots():
+    """空段被跳过、全空返回 None —— 别给后端发一个空 system。"""
+    assert compose_system(None, ["", "   "]) is None
+    assert compose_system("只有这个", [""]) == "只有这个"
 
 
 def test_sanitize_drops_tool_call_without_response():
