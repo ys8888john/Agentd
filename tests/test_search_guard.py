@@ -210,3 +210,32 @@ def test_zhipu_failure_falls_through_with_reason(monkeypatch):
     assert "智谱搜索不可用" in out
     assert "Bing 不可达（假）" in out
     assert "搜狗也不可用" in out
+
+
+def test_no_zhipu_key_skips_backend_entirely(monkeypatch):
+    """没配智谱 key：智谱连请求都不该发，直接走 Bing（行为与旧版一致）。"""
+    async def run():
+        server, url, state = await _start_fake_api()
+        async with server:
+            monkeypatch.delenv("AGENTD_ZHIPU_API_KEY", raising=False)
+            monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+            monkeypatch.setenv("AGENTD_ZHIPU_SEARCH_ENDPOINT", url)  # 即使指了地址也不该被打到
+            monkeypatch.delenv("AGENTD_SEARCH_ENDPOINT", raising=False)
+
+            async def fake_bing(query, limit):
+                # 标题/摘要必须回显 query 词：否则会被 _looks_degraded 相关性
+                # 抽查判成"答非所问"，按设计回落搜狗（真实事故防护，别绕过它）
+                return ([{"title": "Bing 结果：python asyncio 教程",
+                          "url": "https://example.com/b",
+                          "snippet": "python asyncio 教程：事件循环、协程与任务编排的入门内容"}], "约 1,000 个结果")
+            monkeypatch.setattr(tools_mod, "_search_bing", fake_bing)
+
+            box = NativeToolbox(cwd=Path.cwd(), profile="native")
+            out = await box.call("web_search", json.dumps({"query": "python asyncio 教程", "count": 5}))
+        return out, state
+
+    out, state = asyncio.run(run())
+    assert state["requests"] == 0, "没配 key 时智谱 API 不应被请求"
+    assert "智谱" not in out
+    assert "Bing 结果" in out
+    assert "约 1,000 个结果" in out  # Bing 路径自带结果数提示
