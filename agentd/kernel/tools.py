@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -257,6 +258,45 @@ def _sogou_endpoint() -> str:
     """搜狗后端地址，同上可被 AGENTD_SOGOU_ENDPOINT 覆盖（离线单测用）。"""
     return os.getenv("AGENTD_SOGOU_ENDPOINT") or _SOGOU_ENDPOINT
 
+
+# ---- 搜索结果缓存 + 搜狗熔断（2026-10-08 事故二）----
+# 实测：一轮对话里模型对同一个 query 连打了 6 次 web_search（外加 4 次兜底），
+# 快速连打第 2 次起搜狗就弹验证码反爬，兜底整段失效。三层对策：
+#   1. 结果缓存：同 (query, limit) 5 分钟内直接回上一次的结果 —— 模型"换个
+#      说法再试一下/原样重试"是高频行为，缓存能挡掉绝大多数重复请求；
+#   2. 节流：两次搜狗请求至少间隔 _SOGOU_THROTTLE_SECS 秒；
+#   3. 熔断：一旦触发验证码，冷却 _SOGOU_COOLDOWN_SECS 秒内不再碰搜狗，
+#      免得每轮都白等一次超时、还火上浇油地续期反爬。
+_SEARCH_CACHE_TTL = 300.0  # 秒
+_SEARCH_CACHE_MAX = 32
+_search_cache: dict[tuple[str, int], tuple[float, str]] = {}
+
+_SOGOU_THROTTLE_SECS = 3.0
+_SOGOU_COOLDOWN_SECS = 90.0
+# 进程级状态（节流/熔断对整个进程生效才有意义）；测试可直接整体替换。
+_sogou_state = {"last_request": 0.0, "cooldown_until": 0.0}
+
+
+def _search_cache_get(key: tuple[str, int]) -> str | None:
+    hit = _search_cache.get(key)
+    if hit is None:
+        return None
+    at, value = hit
+    if time.monotonic() - at > _SEARCH_CACHE_TTL:
+        _search_cache.pop(key, None)
+        return None
+    return value
+
+
+def _search_cache_put(key: tuple[str, int], value: str) -> None:
+    if len(_search_cache) >= _SEARCH_CACHE_MAX:
+        # 丢掉最旧的一半，别在这里讲 LRU 大道理
+        for k in sorted(_search_cache, key=lambda k: _search_cache[k][0])[
+            : _SEARCH_CACHE_MAX // 2
+        ]:
+            _search_cache.pop(k, None)
+    _search_cache[key] = (time.monotonic(), value)
+
 # 必须伪装成浏览器：默认 UA（httpx/urllib）会被 Bing 直接挡掉。
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -469,14 +509,16 @@ def _parse_sogou(page: str, limit: int) -> list[dict]:
         anchor = _SOGOU_ANCHOR_RX.search(block)
         if anchor is None:
             continue
-        title = _text_of(_COMMENT_RX.sub("", anchor.group(2)))
-        url = urllib.parse.urljoin("https://www.sogou.com/", anchor.group(1))
+        # 搜狗页面的 href/标题/摘要都是 HTML 转义过的（&amp; 最常见）：不反转义
+        # 的话 URL 会被 web_fetch 原样请求，微信链接直接回"参数错误"页。
+        title = html.unescape(_text_of(_COMMENT_RX.sub("", anchor.group(2))))
+        url = urllib.parse.urljoin("https://www.sogou.com/", html.unescape(anchor.group(1)))
         if not title or not url:
             continue
         snippet = ""
         for rx in (_SOGOU_SNIPPET_RX, _SOGOU_PLAIN_P_RX):
             for frag in rx.findall(block):
-                text = _text_of(_COMMENT_RX.sub("", frag))
+                text = html.unescape(_text_of(_COMMENT_RX.sub("", frag)))
                 if len(text) >= 15:  # 更短的多是日期/标签，不是摘要
                     snippet = text
                     break
@@ -549,7 +591,21 @@ async def _search_bing(query: str, limit: int) -> tuple[list[dict], str]:
 
 
 async def _search_sogou(query: str, limit: int) -> tuple[list[dict], str]:
-    """搜狗备用后端：返回 (结果, "")；任何失败抛 _SearchError。"""
+    """搜狗备用后端：返回 (结果, "")；任何失败抛 _SearchError。
+
+    自带节流与熔断（状态在 _sogou_state）：触发过验证码后冷却期内直接拒绝，
+    不再发请求 —— 连打只会让反爬续期，实测第 2 次请求就会中招。
+    """
+    now = time.monotonic()
+    if now < _sogou_state["cooldown_until"]:
+        raise _SearchError(
+            f"搜狗冷却中（刚才触发过验证码，还剩 "
+            f"{int(_sogou_state['cooldown_until'] - now)} 秒）"
+        )
+    gap = now - _sogou_state["last_request"]
+    if gap < _SOGOU_THROTTLE_SECS:
+        await asyncio.sleep(_SOGOU_THROTTLE_SECS - gap)
+    _sogou_state["last_request"] = time.monotonic()
     try:
         async with httpx.AsyncClient(
             headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
@@ -558,6 +614,7 @@ async def _search_sogou(query: str, limit: int) -> tuple[list[dict], str]:
             resp.raise_for_status()
             page = resp.text
             if _SOGOU_ANTISPIDER_RX.search(page):
+                _sogou_state["cooldown_until"] = time.monotonic() + _SOGOU_COOLDOWN_SECS
                 raise _SearchError("搜狗要求验证码（触发反爬）")
             results = _parse_sogou(page, limit)
             await _resolve_sogou_links(results, client)
@@ -588,9 +645,16 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
         return err("web_search 缺少 query 参数")
     limit = min(max(_as_int(args.get("count"), 5), 1), _MAX_SEARCH_RESULTS)
     # AGENTD_SEARCH_ENDPOINT 指了自定义后端（离线 e2e 的假后端 / 内网镜像）时，
-    # 行为跟旧版完全一致：不做相关性抽查、不碰搜狗 —— 假后端的结果和 query
-    # 本来就零词面重叠，抽查必然误判；用户显式指定的后端也不该被二次猜疑。
+    # 行为跟旧版完全一致：不做相关性抽查、不碰搜狗、不走缓存 —— 假后端的结果
+    # 和 query 本来就零词面重叠，抽查必然误判；用户显式指定的后端也不该被
+    # 二次猜疑或被缓存层挡住（测试要数请求次数）。
     custom_backend = bool(os.getenv("AGENTD_SEARCH_ENDPOINT"))
+
+    cache_key = (query, limit)
+    if not custom_backend:
+        cached = _search_cache_get(cache_key)
+        if cached is not None:
+            return cached
 
     bing: tuple[list[dict], str] | None = None
     bing_err = ""
@@ -600,7 +664,10 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
         bing_err = str(exc)
 
     if bing is not None and (custom_backend or not _looks_degraded(query, bing[0])):
-        return _format_search_results(query, bing[0], bing[1], rt.max_bytes, "")
+        out = _format_search_results(query, bing[0], bing[1], rt.max_bytes, "")
+        if not custom_backend:
+            _search_cache_put(cache_key, out)
+        return out
 
     # 走到这：Bing 失败，或结果答非所问（仅默认后端）→ 搜狗兜底
     if custom_backend:
@@ -612,17 +679,22 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
         if sogou[0]:
             reason = ("Bing 返回的结果与 query 不相关（被降级）" if bing is not None
                       else f"Bing 不可用（{bing_err}）")
-            return _format_search_results(
+            out = _format_search_results(
                 query, sogou[0], "", rt.max_bytes, f"来源：搜狗（{reason}）")
+            _search_cache_put(cache_key, out)
+            return out
         sogou_note = "搜狗没解析出条目"
     except _SearchError as exc:
         sogou_note = f"搜狗也不可用（{exc}）"
 
     if bing is not None:
-        # Bing 被降级但搜狗没顶上：结果给出去但明说不可靠，模型可以换个说法重搜
+        # Bing 被降级但搜狗没顶上：结果给出去但明说不可靠，并且把搜狗失败的
+        # 原因带上 —— 模型看到"验证码/冷却中"就该知道原样重搜没用，要么稍后
+        # 再试要么换说法，而不是对着同一个 query 连打六次。
         return _format_search_results(
             query, bing[0], bing[1], rt.max_bytes,
-            "注意：以下结果可能与 query 不相关（Bing 降级且搜狗兜底失败），建议换个说法重搜")
+            f"注意：以下结果可能与 query 不相关（Bing 降级且搜狗兜底失败：{sogou_note}），"
+            "同一个 query 重搜不会变好，建议换个说法或稍后再试")
     return err(f"web_search 失败：Bing（{bing_err}）；{sogou_note}")
 
 
