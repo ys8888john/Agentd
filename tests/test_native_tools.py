@@ -1,7 +1,7 @@
 """原生工具层（kernel/tools.py）测试。
 
 分六块：
-1. 六个本地工具各自的行为（真文件系统，全在 tmp_path 里）；
+1. 七个本地工具各自的行为（真文件系统，全在 tmp_path 里）；
 2. 路径边界与 profile（能不能越出 cwd、read_only 能不能挡住写）；
 3. needs_approval 的判定矩阵 + AgentMode 的审批/kind 端到端；
 4. ACP 映射：_ACP_KIND 必须覆盖 kernel 产出的每一个 ToolKind（漏一个 = 客户端静默卡死）；
@@ -50,7 +50,7 @@ def box(tmp_path: Path, **kw) -> NativeToolbox:
 
 
 # ---------------------------------------------------------------------------
-# 1) 九个工具
+# 1) 各本地工具
 # ---------------------------------------------------------------------------
 
 
@@ -353,6 +353,128 @@ async def test_run_command_uses_cwd_relative_to_session_root(tmp_path):
         "run_command", json.dumps({"command": f'"{sys.executable}" "{script}"', "cwd": "sub"})
     )
     assert "marker.txt" in out
+
+
+# ---- make_xlsx ----
+
+
+def test_make_xlsx_produces_a_real_zip_with_the_ooxml_parts():
+    """xlsx 本质是 zip：五个必需部件一个都不能少，否则 Excel/openpyxl 打不开。"""
+    import io
+    import zipfile
+
+    from agentd.kernel.tools import build_xlsx_bytes
+
+    data = build_xlsx_bytes("sheet1", [["航班号", "航司"], ["CA1402", "国航"]])
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names = set(z.namelist())
+    assert {
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/worksheets/sheet1.xml",
+    } <= names
+
+
+async def test_make_xlsx_roundtrips_through_openpyxl(tmp_path):
+    """拿 openpyxl 当裁判读回来：表头 / 数字 / 中文 / 工作表名都要对得上。
+
+    openpyxl 是本机 venv 里已装的独立实现 —— 用它交叉验证比"自己解自己写的 zip"
+    可信得多（后者等于用同一套假设自证）。
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+    tb = box(tmp_path)
+    out = await tb.call(
+        "make_xlsx",
+        json.dumps(
+            {
+                "path": "航班列表",
+                "sheet_name": "航班",
+                "headers": ["航班号", "航司", "价格"],
+                "rows": [["CA1402", "国航", 520], ["3U8899", "川航", 410.5]],
+            }
+        ),
+    )
+    assert out.startswith("已新建")
+    target = tmp_path / "航班列表.xlsx"  # 后缀被自动补上
+    assert target.is_file()
+
+    ws = openpyxl.load_workbook(target).active
+    assert ws.title == "航班"
+    assert [c.value for c in ws[1]] == ["航班号", "航司", "价格"]
+    assert ws["A2"].value == "CA1402"
+    assert ws["C2"].value == 520 and isinstance(ws["C2"].value, int)
+    assert ws["C3"].value == 410.5 and isinstance(ws["C3"].value, float)
+
+
+async def test_make_xlsx_does_not_turn_text_into_a_formula(tmp_path):
+    """以 = 开头的抓取文本必须原样是字符串 —— 否则就是公式注入。"""
+    openpyxl = pytest.importorskip("openpyxl")
+    tb = box(tmp_path)
+    await tb.call("make_xlsx", json.dumps({"path": "f.xlsx", "rows": [["=1+1"]]}))
+    ws = openpyxl.load_workbook(tmp_path / "f.xlsx").active
+    assert ws["A1"].value == "=1+1"  # 是字符串，不是公式结果 2
+
+
+async def test_make_xlsx_accepts_object_rows_in_header_order(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    tb = box(tmp_path)
+    await tb.call(
+        "make_xlsx",
+        json.dumps(
+            {
+                "path": "o.xlsx",
+                "headers": ["a", "b"],
+                "rows": [{"a": 1, "b": 2}, {"a": 3, "b": 4}],
+            }
+        ),
+    )
+    ws = openpyxl.load_workbook(tmp_path / "o.xlsx").active
+    assert [c.value for c in ws[1]] == ["a", "b"]
+    assert [c.value for c in ws[2]] == [1, 2]
+
+
+async def test_make_xlsx_rejects_out_of_root_and_bad_args(tmp_path):
+    tb = box(tmp_path)
+    escape = await tb.call(
+        "make_xlsx", json.dumps({"path": "../escape.xlsx", "rows": [[1]]})
+    )
+    assert escape.startswith("[错误]") and "越界" in escape
+
+    assert (await tb.call("make_xlsx", json.dumps({"rows": [[1]]}))).startswith("[错误]")
+    assert (await tb.call(
+        "make_xlsx", json.dumps({"path": "x.xlsx", "rows": []})
+    )).startswith("[错误]")
+    assert (await tb.call(
+        "make_xlsx", json.dumps({"path": "x.xlsx", "rows": "nope"})
+    )).startswith("[错误]")
+    assert (await tb.call(
+        "make_xlsx", json.dumps({"path": "x.xlsx", "headers": "bad", "rows": [[1]]})
+    )).startswith("[错误]")
+
+
+async def test_make_xlsx_requires_approval_like_other_state_changers(tmp_path):
+    """写文件类工具必须弹审批（policy=native 默认行为）。"""
+    tb = box(tmp_path)
+    binding = tb.binding("make_xlsx")
+    assert binding is not None
+    assert binding.requires_permission is True
+    assert binding.kind == "execute"
+    assert "make_xlsx" in TOOL_PROFILES["native"]
+    assert "make_xlsx" not in TOOL_PROFILES["read_only"]
+
+
+async def test_make_xlsx_pads_ragged_rows_to_equal_width(tmp_path):
+    """参差的行要补齐成等宽 —— 否则 openpyxl 看到的列数会随最长行漂移。"""
+    openpyxl = pytest.importorskip("openpyxl")
+    tb = box(tmp_path)
+    await tb.call(
+        "make_xlsx", json.dumps({"path": "r.xlsx", "rows": [[1, 2, 3], [4]]})
+    )
+    ws = openpyxl.load_workbook(tmp_path / "r.xlsx").active
+    assert ws.max_column == 3
+    assert ws["C2"].value is None
 
 
 # ---------------------------------------------------------------------------

@@ -257,16 +257,26 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 | `write_file` | `edit` | **是** | 整体写文件（覆盖），父目录自动创建 |
 | `edit` | `edit` | **是** | 精确字符串替换；`old_string` 不唯一时报错，除非 `replace_all=true` |
 | `run_command` | `execute` | **是** | 在工作目录跑 shell 命令，返回退出码 + stdout/stderr |
+| `make_xlsx` | `execute` | **是** | 把二维数据落成真正的 `.xlsx`（纯标准库手写，无第三方依赖） |
 | `web_search` | `search` | 否 | Bing 搜网页（答非所问时自动换搜狗重试），回"标题 + 直链 + 摘要"，`count` 上限 10 |
 | `web_fetch` | `fetch` | 否 | 抓一个 http(s) 页面，剥成纯文本（最多 2MB） |
 
 `write_file` / `edit` 的输出带 unified diff（行首 `--- / +++ / @@ / - / +`，
 上下文 2 行、超长截断），客户端据此在工具卡片里直接渲染改动前后对比。
 
+**`make_xlsx` 为什么自己拼 XML。** `.xlsx` 本质是个 zip，最小单表文件用
+`zipfile` + 字符串就能拼出来，不必为"偶尔导个表"拉一个 200KB 级的 `openpyxl`
+依赖进 agentd（它只依赖 agent-client-protocol / httpx / pydantic / mcp）。
+入参：`path`（缺 `.xlsx` 自动补）、`headers`（可选表头）、`rows`（二维数组，
+或按 headers 顺序取值的对象数组）、`sheet_name`。单元格一律写 `inlineStr` ——
+既省掉 sharedStrings 表，又天然规避公式注入（`=SUM(...)` 之类被抓来的文本
+只会是字符串，不会被 Excel 当公式求值）。局限（刻意保留）：单表、纯文本/数字、
+无合并单元格 / 公式 / 条件格式；要更复杂的表就交给 `run_command` 调专业库。
+
 约束与限额：路径必须落在会话 cwd 内，或客户端在 `session/new` /
 `session/load` 里声明的 `additionalDirectories`（额外工作区根）里
 （`..` 会被 `resolve` 展开后再判，`AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；
-单次返回文本上限 64KB；
+单次返回文本上限 64KB；`make_xlsx` 上限 20000 行 × 200 列；
 `run_command` 默认 30 秒超时、非零退出码按失败上报。
 
 **为什么不全走 MCP。** MCP 的 stdio 客户端内部是 anyio task group，
@@ -634,7 +644,8 @@ echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链�
 
 原生工具的测试在 `tests/test_native_tools.py`，分七块：
 
-1. 六个**本地**工具各自的行为（真文件系统，全在 `tmp_path` 里）；
+1. 七个**本地**工具各自的行为（真文件系统，全在 `tmp_path` 里；`make_xlsx`
+   的产物用 `openpyxl` 交叉读回做裁判）；
 2. 路径边界（`../` 越界、`allow_outside`）与 profile（`read_only` 挡不挡得住写）；
 3. `needs_approval` 判定矩阵 + `AgentMode` 的 kind 映射 / 审批通过 / 审批拒绝 /
    审批通道抛异常；

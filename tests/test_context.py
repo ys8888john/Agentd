@@ -314,6 +314,8 @@ def test_behavior_guide_pins_the_two_hard_rules():
     """行为规范必须钉住两条最常踩的规则：过程台词不进正文、点名格式要照做。"""
     assert "不要写进正文" in BEHAVIOR_GUIDE
     assert "列表" in BEHAVIOR_GUIDE and "表格" in BEHAVIOR_GUIDE
+    # 要 Excel 文件时得指向真正的工具，别让模型用 write_file 假写表格
+    assert "make_xlsx" in BEHAVIOR_GUIDE
     # 短提示才值得每轮都付：超过一屏就说明它在做"行为手册"，不是钉约束
     assert len(BEHAVIOR_GUIDE) < 400
 

@@ -1,5 +1,8 @@
 """原生工具层：跑在 agentd 进程内的文件 / 命令 / 联网工具。
 
+当前原生工具：read_file / list_dir / glob / grep / write_file / edit / run_command /
+make_xlsx（纯标准库手写 .xlsx，见下方「Excel 生成」一节）/ web_search / web_fetch。
+
 为什么不全部交给 MCP？MCP 的 stdio 客户端内部是 anyio task group，**必须与 enter/exit
 同 task**（见 mcp.py 开头的生命周期说明），所以现在每轮 run 都要现开现关一次子进程。
 读文件、搜代码这类动作一次对话里要用几十次，全走 MCP 等于每轮重启一次 node/python，
@@ -1204,6 +1207,205 @@ def _diff_block(before: str, after: str, label: str, max_lines: int = 80) -> str
     return "\n".join(shown) + tail
 
 
+# ---------------------------------------------------------------------------
+# Excel 生成（make_xlsx）—— 纯标准库手写 .xlsx，不引 openpyxl
+# ---------------------------------------------------------------------------
+#
+# 为什么自己拼 XML 而不依赖 openpyxl：
+# 1. agentd 的依赖只有 agent-client-protocol / httpx / pydantic / mcp，为
+#    "偶尔导个表"再拉一个 200KB 级的库不划算；xlsx 本质是个 zip，最小单表
+#    文件用 zipfile + 字符串就能拼出来。
+# 2. 模型要的是"把已知的二维数据落成文件"，不需要读写公式 / 图表 / 样式引擎 ——
+#    那些正是 openpyxl 的重量所在。
+#
+# 局限（刻意保留）：只写一个工作表、只放文本与数字、不做合并单元格 / 公式 /
+# 条件格式。要更复杂的表，让用户改用 run_command 调专业库。
+
+# 单元格上限：防模型一口气塞几十万行把内存和耗时打爆（xlsx 本身能更大，
+# 但一次工具调用的输出不该无界）。
+_MAX_XLSX_ROWS = 20000
+_MAX_XLSX_COLS = 200
+_MAX_XLSX_CELL = 32767  # Excel 单元格字符上限，超了 Excel 打开会报错
+
+_XLSX_CONTENT_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/xl/workbook.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    '<Override PartName="/xl/worksheets/sheet1.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    "</Types>"
+)
+
+_XLSX_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" '
+    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+    'Target="xl/workbook.xml"/>'
+    "</Relationships>"
+)
+
+_XLSX_WB_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" '
+    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+    'Target="worksheets/sheet1.xml"/>'
+    "</Relationships>"
+)
+
+
+def _xlsx_escape(text: str) -> str:
+    """XML 文本转义（xlsx 的 inline string 走这个）。"""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _xlsx_col_name(index: int) -> str:
+    """0-based 列号 → Excel 列名（0→A, 25→Z, 26→AA）。"""
+    name = ""
+    index += 1
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        name = chr(ord("A") + rem) + name
+    return name
+
+
+def _xlsx_cell(row_idx: int, col_idx: int, value: Any) -> str:
+    ref = f"{_xlsx_col_name(col_idx)}{row_idx}"
+    if value is None:
+        # 空单元格：**不写 <c> 元素**才算真正的"空白"。
+        # 写成 <c t="inlineStr"><is><t></t></is></c> 会让 openpyxl 读回空字符串
+        # ""，而不是 None —— 补宽产生的占位格必须读回 None 才对。
+        return ""
+    if isinstance(value, bool):
+        # bool 在 Excel 里是 TRUE/FALSE 单元格，别落到 0/1 的歧义上
+        return f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>'
+    if isinstance(value, (int, float)):
+        return f'<c r="{ref}"><v>{value}</v></c>'
+    text = str(value)
+    if len(text) > _MAX_XLSX_CELL:
+        text = text[:_MAX_XLSX_CELL]
+    # 一律用 inlineStr：不依赖 sharedStrings 表，且天然规避公式注入
+    return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xlsx_escape(text)}</t></is></c>'
+
+
+def build_xlsx_bytes(sheet_name: str, rows: list[list[Any]]) -> bytes:
+    """把二维数据编成一个最小 .xlsx（单表）的字节串。
+
+    纯函数、不碰文件系统 —— 方便单测直接解 zip 校验内容。
+    """
+    import io
+    import zipfile
+
+    safe_name = (sheet_name or "Sheet1")[:31] or "Sheet1"
+    # 工作表名里这几个字符 Excel 不允许
+    for bad in ("\\", "/", "?", "*", "[", "]", ":"):
+        safe_name = safe_name.replace(bad, "_")
+
+    sheet_rows: list[str] = []
+    for r_i, row in enumerate(rows, start=1):
+        cells = "".join(_xlsx_cell(r_i, c_i, v) for c_i, v in enumerate(row))
+        sheet_rows.append(f'<row r="{r_i}">{cells}</row>')
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(sheet_rows)}</sheetData></worksheet>"
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{_xlsx_escape(safe_name)}" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", _XLSX_CONTENT_TYPES)
+        z.writestr("_rels/.rels", _XLSX_RELS)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", _XLSX_WB_RELS)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+def _coerce_rows(raw: Any) -> list[list[Any]] | str:
+    """把模型给的 rows 参数规整成 list[list]。
+
+    容忍两种常见形态：真正的二维数组，或"每行是 {列名: 值}"的对象数组
+    （后者用 headers 顺序取值）。返回字符串=错误信息。
+    """
+    if not isinstance(raw, list) or not raw:
+        return "rows 必须是非空的二维数组（每行一个数组）"
+    out: list[list[Any]] = []
+    for i, row in enumerate(raw):
+        if isinstance(row, dict):
+            out.append(list(row.values()))
+        elif isinstance(row, (list, tuple)):
+            out.append([v for v in row])
+        else:
+            return f"rows[{i}] 不是数组：要二维数组（每行一个数组）或对象数组"
+    return out
+
+
+async def _make_xlsx(args: dict, rt: ToolRuntime) -> str:
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return err("make_xlsx 缺少 path 参数（如 航班列表.xlsx）")
+    if not raw_path.lower().endswith(".xlsx"):
+        raw_path += ".xlsx"  # 模型常忘后缀，补上比报错友好
+
+    rows = _coerce_rows(args.get("rows"))
+    if isinstance(rows, str):
+        return err(rows)
+    headers = args.get("headers")
+    if headers is not None:
+        if not isinstance(headers, list):
+            return err("headers 必须是字符串数组（表头）")
+        rows = [list(headers)] + rows
+
+    if len(rows) > _MAX_XLSX_ROWS:
+        return err(f"行数 {len(rows)} 超过上限 {_MAX_XLSX_ROWS}，请拆分或改用 run_command")
+    width = max((len(r) for r in rows), default=0)
+    if width > _MAX_XLSX_COLS:
+        return err(f"列数 {width} 超过上限 {_MAX_XLSX_COLS}")
+    # 补齐短行，让每行等宽（Excel 里允许参差，但等宽更好看、也省得模型纠结）
+    rows = [list(r) + [None] * (width - len(r)) for r in rows]
+
+    path = _resolve(raw_path, rt)
+    if path is None:
+        return err(_OUT_OF_ROOT.format(raw=raw_path, root=rt.root.as_posix()))
+    existed = path.exists()
+
+    sheet_name = str(args.get("sheet_name") or "Sheet1")
+    try:
+        data = build_xlsx_bytes(sheet_name, rows)
+    except Exception as exc:  # noqa: BLE001 - 编码失败按工具失败上报
+        return err(f"生成 xlsx 失败：{type(exc).__name__}: {exc}")
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as exc:
+        return err(f"写 {raw_path} 失败：{type(exc).__name__}: {exc}")
+
+    action = "覆盖" if existed else "新建"
+    shown = _display(path, rt)
+    return (
+        f"已{action} Excel 文件 {shown}（{len(rows)} 行 × {width} 列，{len(data)} 字节）。"
+        f"用户可在文件管理器打开，或用 run_command 调 python 进一步处理。"
+    )
+
+
 async def _run_command(args: dict, rt: ToolRuntime) -> str:
     command = str(args.get("command") or "").strip()
     if not command:
@@ -1386,6 +1588,37 @@ _SPECS: tuple[NativeTool, ...] = (
             "required": ["command"],
         },
         handler=_run_command,
+        kind="execute",
+        requires_permission=True,
+    ),
+    NativeTool(
+        name="make_xlsx",
+        description=(
+            "把二维数据生成为一个真正的 Excel 文件（.xlsx）。"
+            "用户要「导出 Excel / 表格文件 / xlsx」时用它 —— 不要用 write_file "
+            "假装写表格（write_file 只写纯文本，产出的不是合法 xlsx）。"
+            "headers 传表头字符串数组（可选）；rows 传二维数组，每行一个数组，"
+            "单元格可以是文本或数字；path 传落盘路径（相对工作目录，缺 .xlsx 会自动补）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "输出路径，如 航班列表.xlsx"},
+                "headers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "表头（可选），会作为第一行",
+                },
+                "rows": {
+                    "type": "array",
+                    "description": "数据行：二维数组（每行一个数组），或对象数组（按 headers 顺序取值）",
+                    "items": {},
+                },
+                "sheet_name": {"type": "string", "description": "工作表名，默认 Sheet1"},
+            },
+            "required": ["path", "rows"],
+        },
+        handler=_make_xlsx,
         kind="execute",
         requires_permission=True,
     ),
