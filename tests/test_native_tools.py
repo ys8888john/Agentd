@@ -1056,14 +1056,19 @@ def test_web_search_reports_connection_failure(monkeypatch):
     """连不上时必须回 [错误] 前缀（AgentMode 靠它把卡片标成 failed），而不是抛异常。
 
     指向 127.0.0.1:9 是刻意的：本地必然立刻拒绝，不产生任何外网流量。
+    Bing 和搜狗两个后端都要指过去 —— 主后端挂了会去试备用，只堵一个的话
+    这条测试会真连外网搜狗，既离线不了、结果也随网络波动。
     """
     import agentd.kernel.tools as tools_mod
 
     _bypass_sandbox_proxy(monkeypatch)
     monkeypatch.setattr(tools_mod, "_SEARCH_ENDPOINT", "http://127.0.0.1:9/search")
+    monkeypatch.setattr(tools_mod, "_SOGOU_ENDPOINT", "http://127.0.0.1:9/web")
     tb = box(Path.cwd())
     out = asyncio.run(tb.call("web_search", json.dumps({"query": "x"})))
-    assert out.startswith("[错误]") and "联网搜索失败" in out
+    assert out.startswith("[错误]"), out
+    assert "web_search 失败" in out
+    assert "搜狗也不可用" in out  # 兜底链路确实被走到了
 
 
 def test_web_fetch_reports_connection_failure(monkeypatch):
@@ -1090,6 +1095,14 @@ def test_search_endpoint_is_overridable_by_env(monkeypatch):
     # 空串当"没设"处理，否则端点会变成空 URL、报一个看不懂的错
     monkeypatch.setenv("AGENTD_SEARCH_ENDPOINT", "")
     assert tools_mod._search_endpoint() == tools_mod._SEARCH_ENDPOINT
+
+    # 搜狗备用后端同款覆盖能力（离线单测要把两个后端都指走，见上面的连接失败测试）
+    monkeypatch.delenv("AGENTD_SOGOU_ENDPOINT", raising=False)
+    assert tools_mod._sogou_endpoint() == tools_mod._SOGOU_ENDPOINT
+    monkeypatch.setenv("AGENTD_SOGOU_ENDPOINT", "http://127.0.0.1:1234/web")
+    assert tools_mod._sogou_endpoint() == "http://127.0.0.1:1234/web"
+    monkeypatch.setenv("AGENTD_SOGOU_ENDPOINT", "")
+    assert tools_mod._sogou_endpoint() == tools_mod._SOGOU_ENDPOINT
 
 
 def test_web_tools_are_registered_readonly():

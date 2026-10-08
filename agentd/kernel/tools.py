@@ -221,16 +221,25 @@ _OUT_OF_ROOT = "路径越界：{raw} 不在工作目录 {root} 内（要放开�
 # 联网工具（web_search / web_fetch）
 # ---------------------------------------------------------------------------
 
-# 搜索引擎只有一个后端：Bing。**这不是偷懒，是实测筛出来的**（2026-09-14）：
+# 搜索引擎主后端：Bing。**这不是偷懒，是实测筛出来的**（2026-09-14）：
 #   - DuckDuckGo（lite. / html.duckduckgo.com）：走隧道全是 502，验不了 ——
-#     写一个自己验不了的解析器等于埋雷，所以宁可不写；
+#     写一个自己验不了的解析器等于埋雷，所以宁可不写；（2026-10-08 复测仍连不上）
 #   - 公共 SearXNG 实例：同样被挡；
-#   - Baidu：返回"百度安全验证"反爬页，不是结果页；
+#   - Baidu：返回"百度安全验证"反爬页，不是结果页（2026-10-08 复测这次通了，
+#     但结果 URL 全是 baidu.com/link 跳转，反爬时好时坏，不做主后端）；
 #   - Bing（cn.bing.com / www.bing.com）：通，中英文都能稳定拿到 10 条，
 #     而且结果是目标站**直链**（不用解跳转包装）。
 # 要加后端的话形状很固定：拉 HTML → 解析成 {title, url, snippet}，
 # 在 _parse_bing 旁边照写一个就行。
+#
+# **Bing 有个修不掉的毛病**（2026-10-08 实测，见 _looks_degraded）：带出行/票务
+# 意图的 query（机票/高铁票…）会被砍成只搜第一个词——「成都飞北京机票价格」
+# 返回的其实是搜「成都」的结果。cookie 预热、mkt、format=rss、换新 UA、补全
+# 浏览器头、引号强查，全试过无效，是 Bing 对非交互客户端的处理。
+# 所以主后端之外再备一个**搜狗**（实测对同一 query 返回真实机票结果）：
+# Bing 结果做相关性抽查，答非所问就换搜狗重试。
 _SEARCH_ENDPOINT = "https://cn.bing.com/search"
+_SOGOU_ENDPOINT = "https://www.sogou.com/web"
 
 
 def _search_endpoint() -> str:
@@ -242,6 +251,11 @@ def _search_endpoint() -> str:
       - cn.bing.com 在有些网络里不通，换个镜像不用改代码。
     """
     return os.getenv("AGENTD_SEARCH_ENDPOINT") or _SEARCH_ENDPOINT
+
+
+def _sogou_endpoint() -> str:
+    """搜狗后端地址，同上可被 AGENTD_SOGOU_ENDPOINT 覆盖（离线单测用）。"""
+    return os.getenv("AGENTD_SOGOU_ENDPOINT") or _SOGOU_ENDPOINT
 
 # 必须伪装成浏览器：默认 UA（httpx/urllib）会被 Bing 直接挡掉。
 _BROWSER_UA = (
@@ -280,6 +294,21 @@ _BING_BLOCK_SPLIT = re.compile(r'<li class="b_algo"')
 _BING_ANCHOR_RX = re.compile(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
 _BING_SNIPPET_RX = re.compile(r"<p[^>]*>(.*?)</p>", re.S)
 _BING_COUNT_RX = re.compile(r'<span class="sb_count"[^>]*>(.*?)</span>', re.S)
+
+# 搜狗结果页的形状（2026-10-08 实测）：结果在 `<div class="vrwrap">` 块里，
+# 标题+链接是块内 `h3.vr-title > a`（标题里的 <em> 高亮和 <!--red_beg--> 注释要剥掉）；
+# 摘要没有统一容器（text-layout / space-txt / star-wiki 都见过），取块内第一段
+# 长度够的文本凑合。`/link?url=` 不是 302，是个 200 小中转页，真实地址写在
+# meta refresh 和 window.location.replace 里（见 _resolve_sogou_links）。
+_SOGOU_BLOCK_SPLIT = re.compile(r'<div class="vrwrap"')
+_SOGOU_ANCHOR_RX = re.compile(
+    r'<h3[^>]*class="[^"]*vr-title[^"]*"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_SOGOU_SNIPPET_RX = re.compile(
+    r'<(?:p|div)[^>]*class="[^"]*(?:text-layout|space-txt|star-wiki)[^"]*"[^>]*>(.*?)</(?:p|div)>', re.S)
+_SOGOU_PLAIN_P_RX = re.compile(r"<p[^>]*>(.*?)</p>", re.S)
+_SOGOU_LINK_JS_RX = re.compile(r'window\.location\.replace\("([^"]+)"\)')
+_SOGOU_LINK_META_RX = re.compile(r'<meta[^>]*url=("|\')?([^"\'>\s]+)', re.I)
+_SOGOU_ANTISPIDER_RX = re.compile(r"验证码|antispider", re.I)
 
 # content-type 里出现这些片段就当作"能当文本看"
 _TEXTUAL_HINTS = ("text/", "json", "xml", "javascript", "x-www-form-urlencoded")
@@ -344,7 +373,8 @@ def _parse_bing(page: str, limit: int) -> tuple[list[dict], str]:
     ⚠️ 已知限制：**Bing 查不到东西时不给"无结果"标记**，而是塞一批不相关结果
     （实测乱码 query 返回了一屏"抖音"）；页面上也没有可靠的空结果标志
     （`b_no` 在有结果的页面上同样出现，是别的用途）。所以这里不做"无结果"判定，
-    只能靠把 query 写具体。这条已写进 README，别指望在这里修。
+    只能靠把 query 写具体。这类"答非所问"现在由 _looks_degraded 抽查 +
+    搜狗兜底来兜（见 _web_search），解析层不做判定。
     """
     results: list[dict] = []
     for block in _BING_BLOCK_SPLIT.split(page)[1:]:
@@ -395,12 +425,105 @@ def _html_to_text(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
-async def _web_search(args: dict, rt: ToolRuntime) -> str:
-    query = str(args.get("query") or "").strip()
-    if not query:
-        return err("web_search 缺少 query 参数")
-    limit = min(max(_as_int(args.get("count"), 5), 1), _MAX_SEARCH_RESULTS)
+class _SearchError(Exception):
+    """某个搜索后端不可用（网络 / HTTP 状态 / 反爬 / 解析不出条目）。"""
 
+
+def _query_fingerprint(query: str) -> list[str]:
+    """query 的内容指纹：中文段拆 2-gram，英文/数字段整段小写。
+
+    不做真分词（不引依赖），2-gram 足以回答"结果里有没有出现 query 的词"。
+    「成都飞北京机票价格 2024年」→ 成都/都飞/飞北/北京/京机/机票/票价/价格/2024/年。
+    """
+    grams: list[str] = []
+    for seg in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9]{2,}", query):
+        if seg.isascii():
+            grams.append(seg.lower())
+        elif len(seg) == 1:
+            grams.append(seg)
+        else:
+            grams.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+    return grams
+
+
+def _looks_degraded(query: str, results: list[dict]) -> bool:
+    """Bing 是否在答非所问（结果几乎不含 query 的内容词）。
+
+    实测（2026-10-08）：「成都飞北京机票价格」被降级成搜「成都」，top5 的
+    标题+摘要只能命中「成都」一两个 2-gram；正常结果至少命中机票/价格/北京等
+    好几个。阈值取指纹的一半（至少 2）：真结果过线很宽裕，降级结果够不着。
+    指纹凑不齐 3 个（query 本身太短）时不判定 —— 分不出来，宁可信 Bing。
+    """
+    grams = set(_query_fingerprint(query))
+    if len(grams) < 3:
+        return False
+    corpus = " ".join(f"{it['title']} {it['snippet']}" for it in results).lower()
+    hits = sum(1 for g in grams if g in corpus)
+    return hits < max(2, len(grams) // 2)
+
+
+def _parse_sogou(page: str, limit: int) -> list[dict]:
+    """解析搜狗结果页，形状见 _SOGOU_* 正则上方的注释。"""
+    results: list[dict] = []
+    for block in _SOGOU_BLOCK_SPLIT.split(page)[1:]:
+        anchor = _SOGOU_ANCHOR_RX.search(block)
+        if anchor is None:
+            continue
+        title = _text_of(_COMMENT_RX.sub("", anchor.group(2)))
+        url = urllib.parse.urljoin("https://www.sogou.com/", anchor.group(1))
+        if not title or not url:
+            continue
+        snippet = ""
+        for rx in (_SOGOU_SNIPPET_RX, _SOGOU_PLAIN_P_RX):
+            for frag in rx.findall(block):
+                text = _text_of(_COMMENT_RX.sub("", frag))
+                if len(text) >= 15:  # 更短的多是日期/标签，不是摘要
+                    snippet = text
+                    break
+            if snippet:
+                break
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def _resolve_sogou_links(results: list[dict], client: httpx.AsyncClient) -> None:
+    """把 `/link?url=` 中转链接换成真实地址；解不出的保持原样。
+
+    中转页只有 200 来字节（meta refresh + location.replace 双保险），
+    用 stream 限读 16KB，防止个别链接真的 302 到大文章时把整页拖下来。
+    """
+    for item in results:
+        if "/link?url=" not in item["url"]:
+            continue
+        try:
+            async with client.stream("GET", item["url"]) as resp:
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes(4096):
+                    buf.extend(chunk)
+                    if len(buf) >= 16384:
+                        break
+                body = bytes(buf).decode("utf-8", "replace")
+                final_url = str(resp.url)
+        except httpx.HTTPError:
+            continue
+        # 真 302 了就直接用落点；还停在中转页就从页面里抠目标地址
+        if final_url != item["url"] and "sogou.com/link" not in final_url \
+                and final_url.startswith(("http://", "https://")):
+            item["url"] = final_url
+            continue
+        m = _SOGOU_LINK_JS_RX.search(body)
+        real = m.group(1) if m else ""
+        if not real:
+            m = _SOGOU_LINK_META_RX.search(body)
+            real = html.unescape(m.group(2)) if m else ""
+        if real.startswith(("http://", "https://")):
+            item["url"] = real
+
+
+async def _search_bing(query: str, limit: int) -> tuple[list[dict], str]:
+    """Bing 主后端：返回 (结果, 结果数提示)；任何失败抛 _SearchError。"""
     try:
         async with httpx.AsyncClient(
             headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
@@ -412,26 +535,95 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
             resp.raise_for_status()
             page = resp.text
     except httpx.HTTPStatusError as exc:
-        return err(f"搜索引擎返回 HTTP {exc.response.status_code}（多半被限流，稍后再试）")
+        raise _SearchError(
+            f"搜索引擎返回 HTTP {exc.response.status_code}（多半被限流，稍后再试）"
+        ) from exc
     except httpx.HTTPError as exc:
-        return err(f"联网搜索失败：{type(exc).__name__}: {exc}")
-
+        raise _SearchError(f"{type(exc).__name__}: {exc}") from exc
     results, count_hint = _parse_bing(page, limit)
     if not results:
-        return err(
-            f"没能从结果页解析出条目（query={query!r}，页面 {len(page)} 字符）。"
-            "可能是被限流，或者 Bing 换了页面结构。"
+        raise _SearchError(
+            f"没能从结果页解析出条目（页面 {len(page)} 字符；可能被限流或页面结构变了）"
         )
+    return results, count_hint
+
+
+async def _search_sogou(query: str, limit: int) -> tuple[list[dict], str]:
+    """搜狗备用后端：返回 (结果, "")；任何失败抛 _SearchError。"""
+    try:
+        async with httpx.AsyncClient(
+            headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
+        ) as client:
+            resp = await client.get(_sogou_endpoint(), params={"query": query})
+            resp.raise_for_status()
+            page = resp.text
+            if _SOGOU_ANTISPIDER_RX.search(page):
+                raise _SearchError("搜狗要求验证码（触发反爬）")
+            results = _parse_sogou(page, limit)
+            await _resolve_sogou_links(results, client)
+    except httpx.HTTPError as exc:
+        raise _SearchError(f"{type(exc).__name__}: {exc}") from exc
+    return results, ""
+
+
+def _format_search_results(query: str, results: list[dict], count_hint: str,
+                           max_bytes: int, source_note: str) -> str:
     head = f"「{query}」搜索到 {len(results)} 条"
     if count_hint:
         head += f"（{count_hint}）"
     lines = [head]
+    if source_note:
+        lines.append(source_note)
     for i, item in enumerate(results, 1):
         lines.append(f"{i}. {item['title']}\n   {item['url']}")
         if item["snippet"]:
             lines.append(f"   {item['snippet']}")
     lines.append("要看正文可以用 web_fetch 打开上面的链接。")
-    return _clip("\n".join(lines), rt.max_bytes, what="搜索结果")
+    return _clip("\n".join(lines), max_bytes, what="搜索结果")
+
+
+async def _web_search(args: dict, rt: ToolRuntime) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return err("web_search 缺少 query 参数")
+    limit = min(max(_as_int(args.get("count"), 5), 1), _MAX_SEARCH_RESULTS)
+    # AGENTD_SEARCH_ENDPOINT 指了自定义后端（离线 e2e 的假后端 / 内网镜像）时，
+    # 行为跟旧版完全一致：不做相关性抽查、不碰搜狗 —— 假后端的结果和 query
+    # 本来就零词面重叠，抽查必然误判；用户显式指定的后端也不该被二次猜疑。
+    custom_backend = bool(os.getenv("AGENTD_SEARCH_ENDPOINT"))
+
+    bing: tuple[list[dict], str] | None = None
+    bing_err = ""
+    try:
+        bing = await _search_bing(query, limit)
+    except _SearchError as exc:
+        bing_err = str(exc)
+
+    if bing is not None and (custom_backend or not _looks_degraded(query, bing[0])):
+        return _format_search_results(query, bing[0], bing[1], rt.max_bytes, "")
+
+    # 走到这：Bing 失败，或结果答非所问（仅默认后端）→ 搜狗兜底
+    if custom_backend:
+        return err(f"web_search 失败：{bing_err}")
+
+    sogou_note = ""
+    try:
+        sogou = await _search_sogou(query, limit)
+        if sogou[0]:
+            reason = ("Bing 返回的结果与 query 不相关（被降级）" if bing is not None
+                      else f"Bing 不可用（{bing_err}）")
+            return _format_search_results(
+                query, sogou[0], "", rt.max_bytes, f"来源：搜狗（{reason}）")
+        sogou_note = "搜狗没解析出条目"
+    except _SearchError as exc:
+        sogou_note = f"搜狗也不可用（{exc}）"
+
+    if bing is not None:
+        # Bing 被降级但搜狗没顶上：结果给出去但明说不可靠，模型可以换个说法重搜
+        return _format_search_results(
+            query, bing[0], bing[1], rt.max_bytes,
+            "注意：以下结果可能与 query 不相关（Bing 降级且搜狗兜底失败），建议换个说法重搜")
+    return err(f"web_search 失败：Bing（{bing_err}）；{sogou_note}")
 
 
 async def _web_fetch(args: dict, rt: ToolRuntime) -> str:

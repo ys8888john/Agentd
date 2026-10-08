@@ -96,6 +96,7 @@ curl -s localhost:8765/v1/sessions/sess_…/permission \
 | `AGENTD_TOOLS_TIMEOUT` | `run_command` 默认超时（秒） | `30` |
 | `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none` | `native` |
 | `AGENTD_SEARCH_ENDPOINT` | `web_search` 的搜索后端地址 | `https://cn.bing.com/search` |
+| `AGENTD_SOGOU_ENDPOINT` | `web_search` 的搜狗兜底后端地址 | `https://www.sogou.com/web` |
 
 ### `script` 后端：不靠模型也能验工具链
 
@@ -247,7 +248,7 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 | `write_file` | `edit` | **是** | 整体写文件（覆盖），父目录自动创建 |
 | `edit` | `edit` | **是** | 精确字符串替换；`old_string` 不唯一时报错，除非 `replace_all=true` |
 | `run_command` | `execute` | **是** | 在工作目录跑 shell 命令，返回退出码 + stdout/stderr |
-| `web_search` | `search` | 否 | 用 Bing 搜网页，回"标题 + 直链 + 摘要"，`count` 上限 10 |
+| `web_search` | `search` | 否 | Bing 搜网页（答非所问时自动换搜狗重试），回"标题 + 直链 + 摘要"，`count` 上限 10 |
 | `web_fetch` | `fetch` | 否 | 抓一个 http(s) 页面，剥成纯文本（最多 2MB） |
 
 `write_file` / `edit` 的输出带 unified diff（行首 `--- / +++ / @@ / - / +`，
@@ -271,24 +272,34 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 纯文本（去脚本样式 → 块级标签转换行 → 剥标签 → 解实体）。抓取上限 2MB，非文本
 content-type 直接报错不猜 —— 防一个大页面或一个 PDF 把内存和上下文一起灌爆。
 
-**搜索后端只有 Bing，这是实测筛出来的（2026-09-14），不是偷懒：**
+**搜索后端：Bing 为主 + 搜狗兜底，都是实测筛出来的（2026-09-14 / 2026-10-08），不是偷懒：**
 
 | 后端 | 实测结果 |
 |---|---|
-| DuckDuckGo（`lite.` / `html.`） | 走隧道全是 502 —— 自己验不了的解析器等于埋雷，宁可不写 |
+| DuckDuckGo（`lite.` / `html.`） | 走隧道全是 502 —— 自己验不了的解析器等于埋雷，宁可不写（2026-10-08 复测仍连不上） |
 | 公共 SearXNG 实例 | 同上，被挡 |
-| Baidu | 返回"百度安全验证"反爬页，不是结果页 |
-| **Bing（`cn.bing.com`）** | **通**。中英文都能稳定拿到 10 条，且结果是目标站直链 |
+| Baidu | 2026-09-14 返回"百度安全验证"反爬页；2026-10-08 复测通了，但结果 URL 全是 `baidu.com/link` 跳转，反爬时好时坏，不做后端 |
+| **Bing（`cn.bing.com`）** | **主后端**。中英文都能稳定拿到 10 条，且结果是目标站直链 |
+| **搜狗（`www.sogou.com/web`）** | **兜底后端**。Bing 答非所问/挂了时顶上；结果带 `/link` 中转，`_resolve_sogou_links` 会解成真实地址 |
 
 要加后端形状很固定：拉 HTML → 解析成 `{title, url, snippet}`，在 `_parse_bing`
-旁边照写一个即可。地址本身可以用 `AGENTD_SEARCH_ENDPOINT` 换（见配置表）。
+旁边照写一个即可。地址可以用 `AGENTD_SEARCH_ENDPOINT` / `AGENTD_SOGOU_ENDPOINT`
+换（见配置表）。
 
-**两个已知限制，别指望在代码里修掉：**
+**Bing 的已知毛病与对策：**
 
+- **带出行/票务意图的 query 会被"降级"（2026-10-08 实测）**：「成都飞北京机票价格」
+  返回的其实是搜「成都」的结果（连"约 26,800 个结果"都等于「成都」的结果数），
+  「北京到上海高铁票价格」同理只搜了「北京」。cookie 预热、`mkt`、`format=rss`、
+  新 UA、完整浏览器头、引号强查全试过无效 —— 是 Bing 对非交互客户端的处理，
+  修不了。**对策**：`_looks_degraded` 用 query 的内容指纹（中文 2-gram + 英数词）
+  在 top 结果里做命中抽查，几乎命中不到就换搜狗重试；兜底也失败时把 Bing 结果
+  附上"可能答非所问"的警告返回，让模型自己决定换说法重搜。
+  指到自定义后端（`AGENTD_SEARCH_ENDPOINT`）时不做这个抽查 —— 假后端的
+  离线 e2e 结果和 query 本来就零词面重叠，抽查必然误判，显式指定的后端也不该被二次猜疑。
 - **Bing 查不到东西时不给"无结果"标记**，而是塞一批不相关结果（乱码 query 实测返回
   一屏"抖音"）。页面上也没有可靠的空结果标志（`b_no` 在有结果的页面上同样出现，
-  是别的用途）。所以不做"无结果"判定，只能靠把 query 写具体；真返回空列表时报的是
-  "没能从结果页解析出条目"，那更可能是被限流 / Bing 换了页面结构，**不是**"查无此词"。
+  是别的用途）。同上由相关性抽查 + 搜狗兜底来兜。
 - **一页只有 10 条，`count` 也封顶在 10。** 实测传 `count=20` 仍只回 10 个
   `b_algo` 块，所以不做翻页 —— 要更多结果就打几个不同的 query。
 
