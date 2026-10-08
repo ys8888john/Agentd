@@ -60,6 +60,18 @@ class MessageDone(EventBase):
     text: str
 
 
+class Notice(EventBase):
+    """一行系统提示（上下文被裁剪、管理模式自动回落之类）。
+
+    不进正文、不落库 —— 它是"跑这一轮时系统做了什么"，不是模型说的话。
+    跟 ThoughtDelta 的区别：ThoughtDelta 是模型自己的推理过程，Notice 是
+    宿主的行为；混在一起用户会以为模型在自言自语。
+    """
+
+    type: Literal["notice"] = "notice"
+    text: str
+
+
 class ToolCallStart(EventBase):
     """工具调用开始。call_id 用于把 start / done 配对（工具可能并发）。"""
 
@@ -98,6 +110,7 @@ Event: TypeAlias = Annotated[
     Union[
         MessageDelta,
         ThoughtDelta,
+        Notice,
         MessageDone,
         ToolCallStart,
         ToolCallDone,

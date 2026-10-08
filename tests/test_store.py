@@ -84,6 +84,123 @@ async def test_unicode_and_newlines_survive(store):
     assert (await store.history("s1"))[0].content == text
 
 
+# ---- 摘要层（跨会话记忆）----
+
+
+async def test_save_summary_is_an_update_not_an_append(store):
+    """同一个会话反复压缩是**覆盖**：一个会话只有一份"当前进展"。
+
+    若变成追加，recent_summaries 会被同一个会话占满，别的会话就看不见了。
+    """
+    await store.create("s1")
+    await store.save_summary("s1", "第一次压缩")
+    await store.save_summary("s1", "第二次压缩")
+
+    assert [text for _, text in await store.recent_summaries(8)] == ["第二次压缩"]
+
+
+async def test_recent_summaries_returns_oldest_first(store):
+    """给模型的顺序必须是**从旧到新** —— 摘要之间会互相引用（"在之前的基础上…"），
+    倒着给等于让它先读结局再看铺垫。"""
+    await store.create("s1")
+    await store.create("s2")
+    await store.create("s3")
+    await store.save_summary("s1", "第一天")
+    await store.save_summary("s2", "第二天")
+    await store.save_summary("s3", "第三天")
+
+    assert [text for _, text in await store.recent_summaries(8)] == [
+        "第一天",
+        "第二天",
+        "第三天",
+    ]
+
+
+async def test_recent_summaries_excludes_current_session(store):
+    """当前会话自己的摘要要排掉：它的内容已经在上下文里了，再插一份纯属浪费。"""
+    await store.create("s1")
+    await store.create("s2")
+    await store.save_summary("s1", "别人的")
+    await store.save_summary("s2", "自己的")
+
+    got = await store.recent_summaries(8, exclude="s2")
+    assert [text for _, text in got] == ["别人的"]
+
+
+async def test_recent_summaries_respects_limit_after_excluding(store):
+    """排除当前会话后再取 N 条 —— 不能因为 SQL 里先 LIMIT 就把坑位浪费给被排除的那条。"""
+    await store.create("old")
+    await store.create("mid")
+    await store.create("cur")
+    await store.save_summary("old", "老的")
+    await store.save_summary("mid", "中间")
+    await store.save_summary("cur", "当前")
+
+    got = await store.recent_summaries(1, exclude="cur")
+    assert [text for _, text in got] == ["中间"]
+
+
+async def test_recent_summaries_skips_blank(store):
+    await store.create("s1")
+    await store.create("s2")
+    await store.save_summary("s1", "有内容")
+    await store.save_summary("s2", "   ")
+
+    assert [text for _, text in await store.recent_summaries(8)] == ["有内容"]
+
+
+async def test_save_summary_on_unknown_session_raises(store):
+    with pytest.raises(UnknownSessionError):
+        await store.save_summary("ghost", "x")
+
+
+# ---- 自动压缩的水位 ----
+
+
+async def test_compaction_starts_at_zero(store):
+    await store.create("s1")
+    assert await store.compaction("s1") == ("", 0)
+
+
+async def test_save_compaction_records_summary_and_window(store):
+    """压缩同时写两样东西：这一段的摘要，以及"窗口从第几条起"。
+
+    只记摘要不记水位的话，压完上下文一点没变小 —— 那这一趟就算白跑了。
+    """
+    await store.create("s1")
+    await store.save_compaction("s1", "前半段压完了", 12)
+
+    assert await store.compaction("s1") == ("前半段压完了", 12)
+
+
+async def test_compaction_window_only_moves_forward(store):
+    """水位只允许向前。
+
+    往回退意味着把已经压过的对话重新灌回上下文：预算立刻回到原来那么满，
+    而下一轮又会触发一次压缩 —— 一次不成还可以再来，来回抖就是死循环。
+    """
+    await store.create("s1")
+    await store.save_compaction("s1", "压到 20", 20)
+    await store.save_compaction("s1", "这段更短", 8)
+
+    summary, cut = await store.compaction("s1")
+    assert cut == 20
+    # 摘要可以覆盖成更新的版本，只有窗口是单调的
+    assert summary == "这段更短"
+
+
+async def test_save_compaction_without_summary_only_moves_the_window(store):
+    await store.create("s1")
+    await store.save_compaction("s1", "   ", 5)
+
+    assert await store.compaction("s1") == ("", 5)
+
+
+async def test_save_compaction_on_unknown_session_raises(store):
+    with pytest.raises(UnknownSessionError):
+        await store.save_compaction("ghost", "x", 1)
+
+
 async def test_clear_empties_history_but_keeps_session(store):
     await store.create("s1")
     await store.append("s1", Message.user("x"))

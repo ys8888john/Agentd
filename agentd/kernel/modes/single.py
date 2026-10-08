@@ -5,27 +5,37 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
-from ...contracts import MessageDelta, MessageDone
+from ...contracts import MessageDelta, MessageDone, Notice
+from ..llm import LLMNotice, LLMText
 from .base import Mode, ModeContext
 
 
 class SingleMode(Mode):
     name: ClassVar[str] = "single"
 
-    async def run(self, ctx: ModeContext, user_input: str) -> AsyncIterator[MessageDelta | MessageDone]:
+    async def run(
+        self, ctx: ModeContext, user_input: str
+    ) -> AsyncIterator[MessageDelta | MessageDone | Notice]:
         # ctx.history 里已经包含了本轮用户消息（内核在调用前就 append 了）
         chunks: list[str] = []
 
-        stream = ctx.llm.stream(ctx.history, system=ctx.system)
+        # 用 stream_events 而不是 stream：后者只透传文本，会把 LLMNotice
+        # （"上下文被裁了"这类系统提示）滤掉，用户就成了睁眼瞎。
+        stream = ctx.llm.stream_events(ctx.history, system=ctx.system)
         try:
-            async for chunk in stream:
-                if not chunk:
+            async for event in stream:
+                if isinstance(event, LLMNotice):
+                    yield Notice(
+                        session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                    )
                     continue
-                chunks.append(chunk)
+                if not isinstance(event, LLMText) or not event.text:
+                    continue
+                chunks.append(event.text)
                 yield MessageDelta(
                     session_id=ctx.session_id,
                     run_id=ctx.run_id,
-                    text=chunk
+                    text=event.text
                 )
                 # 取消检查贴在每个 chunk 后面：停止请求最多推迟一个 chunk 生效，
                 # 长回答里它是即时可感的。中途 break 必须随即收掉底层 HTTP 流，

@@ -36,6 +36,7 @@ from agentd.kernel.tools import (
     _parse_bing,
     _unwrap_bing_url,
     needs_approval,
+    workspace_brief,
 )
 from agentd.transports.acp_stdio import _ACP_KIND
 
@@ -49,8 +50,115 @@ def box(tmp_path: Path, **kw) -> NativeToolbox:
 
 
 # ---------------------------------------------------------------------------
-# 1) 六个工具
+# 1) 九个工具
 # ---------------------------------------------------------------------------
+
+
+# ---- list_dir ----
+
+
+async def test_list_dir_shows_dirs_before_files(tmp_path):
+    (tmp_path / "notes.md").write_text("x", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x", encoding="utf-8")
+    (tmp_path / "empty-dir").mkdir()   # 空目录：glob 看不见它，list_dir 必须看得见
+    tb = box(tmp_path)
+
+    out = await tb.call("list_dir", "{}")
+    lines = out.splitlines()
+    # 目录排在文件前面且带 / 后缀，模型一眼能分清"能往里钻"和"能读内容"
+    entries = [line.strip() for line in lines[1:]]
+    assert entries == ["empty-dir/", "src/", "notes.md"]
+    # 空目录不会被 _walk_tree 漏掉 —— 这正是补这个工具的主要原因
+    assert "empty-dir/" in out
+
+    # 递归时目录名不许重复：父亲已经列过 src/，孩子只能多一层缩进
+    nested = await tb.call("list_dir", json.dumps({"depth": 2}))
+    assert nested.count("src/") == 1
+    assert "  main.py" in nested
+
+
+async def test_list_dir_depth_controls_recursion(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    (deep / "deep.txt").write_text("x", encoding="utf-8")
+    tb = box(tmp_path)
+
+    shallow = await tb.call("list_dir", "{}")
+    assert "a/" in shallow and "b/" not in shallow
+
+    deeper = await tb.call("list_dir", json.dumps({"depth": 3}))
+    assert "b/" in deeper
+
+
+async def test_list_dir_hides_noise_and_hidden_by_default(tmp_path):
+    (tmp_path / "keep.py").write_text("x", encoding="utf-8")
+    (tmp_path / ".env").write_text("x", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "junk.js").write_text("x", encoding="utf-8")
+    tb = box(tmp_path)
+
+    out = await tb.call("list_dir", "{}")
+    assert "keep.py" in out
+    assert "node_modules" not in out
+    assert ".env" not in out
+
+    # 显式要求时它们必须能出来 —— "默认过滤"不等于"根本拿不到"
+    everything = await tb.call(
+        "list_dir", json.dumps({"include_hidden": True, "include_ignored": True})
+    )
+    assert "node_modules/" in everything
+    assert ".env" in everything
+
+
+async def test_workspace_brief_is_short_and_actionable(tmp_path):
+    """system prompt 里的那份目录清单：必须短、必须带 cwd、必须过滤噪音。"""
+    (tmp_path / "README.md").write_text("x", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "junk.js").write_text("x", encoding="utf-8")
+
+    brief = workspace_brief(tmp_path)
+    assert str(tmp_path) in brief           # 绝对路径：模型要靠它构造其它路径
+    # depth=2 ⇒ 子目录里的文件也要露个头（"src/ 下有 main.py"是最有用的一条）
+    assert "src/" in brief and "main.py" in brief
+    assert "node_modules" not in brief      # 噪音目录不进 system prompt
+    assert "1 个子目录" in brief            # 计数得跟画出来的树对得上
+    # 每一轮的固定开销，不能失控
+    assert len(brief.splitlines()) <= 48
+
+
+async def test_workspace_brief_ok_when_cwd_missing(tmp_path):
+    # 目录被删 / 没权限：环境说明掉了可以，抛异常把整轮搞挂不行
+    assert workspace_brief(tmp_path / "nope") == ""
+
+
+async def test_list_dir_errors(tmp_path):
+    tb = box(tmp_path)
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+
+    # 拿文件当目录用：报错还要把正确的工具指出来（模型下一步才知道该干嘛）
+    out = await tb.call("list_dir", json.dumps({"path": "a.txt"}))
+    assert out.startswith("[错误]") and "read_file" in out
+
+    out = await tb.call("list_dir", json.dumps({"path": "nope"}))
+    assert out.startswith("[错误]") and "不存在" in out
+
+    # 越界同其它工具一样必须拦住
+    out = await tb.call("list_dir", json.dumps({"path": "../"}))
+    assert out.startswith("[错误]") and "越界" in out
+
+
+async def test_list_dir_reports_capacity_and_caps(tmp_path):
+    for i in range(20):
+        (tmp_path / f"f{i:02}.txt").write_text("x", encoding="utf-8")
+    tb = box(tmp_path)
+
+    out = await tb.call("list_dir", json.dumps({"max_results": 5}))
+    assert "已达 5 条上限" in out
+    head = out.splitlines()[0]
+    assert "20 个文件" in head  # 总数照实报，别让模型以为目录里只有 5 个
 
 
 async def test_read_file_numbers_lines_and_respects_offset(tmp_path):
@@ -282,6 +390,7 @@ async def test_profiles_control_which_tools_exist(tmp_path):
     assert NativeToolbox(cwd=tmp_path, profile="native").names == list(ALL_TOOL_NAMES)
     assert NativeToolbox(cwd=tmp_path, profile="read_only").names == [
         "read_file",
+        "list_dir",
         "glob",
         "grep",
     ]
@@ -579,7 +688,7 @@ async def test_kernel_read_only_profile(tmp_path):
 
     [e async for e in kernel.handle(session_id, "hi", mode="agent")]
     names = {t["function"]["name"] for t in llm.seen_tools[0]}
-    assert names == {"read_file", "glob", "grep"}
+    assert names == {"read_file", "list_dir", "glob", "grep"}
 
 
 async def test_kernel_tool_runs_against_session_cwd(tmp_path):
@@ -597,10 +706,14 @@ async def test_kernel_tool_runs_against_session_cwd(tmp_path):
     done = [e for e in events if isinstance(e, ToolCallDone)]
     assert "only-here.txt" in done[0].output
 
-    # 工具卡片现在要落库（role="tool_record"，历史回放用）：库里是
-    # user + 工具记录 + 最终 assistant
+    # 库里一行一行是：user → assistant(举手要调工具) → 工具卡片 Role="tool_record"
+    # （UI 回放用）→ role="tool"（工具真实输出，下一轮要接着给模型看）→ assistant 结论。
+    # 中间那两行是同一件事的两种存法：一个给 UI，一个给模型。
     history = await kernel.history(session_id)
-    assert [m.role for m in history] == ["user", "tool_record", "assistant"]
+    assert [m.role for m in history] == ["user", "assistant", "tool_record", "tool", "assistant"]
+    tool_msg = history[3]
+    assert tool_msg.tool_call_id == "c1"
+    assert "only-here.txt" in tool_msg.content
 
 
 async def test_kernel_approve_callback_is_used(tmp_path):

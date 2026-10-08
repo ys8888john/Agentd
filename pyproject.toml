@@ -12,6 +12,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
+# 三个等价入口，都指向同一个 AgentKernel：
+#   agentd / agentd-gateway / agentd-cli
+# 也可以统一用 `python -m agentd [acp|gateway|cli]`。
+[project.scripts]
+agentd = "agentd.__main__:main"
+agentd-gateway = "agentd.transports.gateway:main"
+agentd-cli = "agentd.transports.cli:main"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

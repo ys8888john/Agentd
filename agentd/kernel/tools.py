@@ -478,7 +478,7 @@ async def _web_fetch(args: dict, rt: ToolRuntime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 八个工具
+# 九个工具
 # ---------------------------------------------------------------------------
 
 
@@ -492,7 +492,7 @@ async def _read_file(args: dict, rt: ToolRuntime) -> str:
     if not path.exists():
         return err(f"文件不存在：{raw}")
     if path.is_dir():
-        return err(f"{raw} 是目录不是文件；列目录请用 glob")
+        return err(f"{raw} 是目录不是文件；列它下面有什么请用 list_dir")
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -540,6 +540,153 @@ async def _glob(args: dict, rt: ToolRuntime) -> str:
     else:
         head += "，按修改时间倒序"
     return _clip(head + "\n" + "\n".join(_display(p, rt) for p in shown), rt.max_bytes)
+
+
+_MAX_LIST_DEPTH = 3     # list_dir 递归深度上限：再深就是整棵树了，没有信息量
+_MAX_LIST_ENTRIES = 300  # 单层最多列出多少条目
+
+_HUMAN_UNITS = ("B", "K", "M", "G")
+
+
+def _human_size(size: int) -> str:
+    """把字节数压成 '1.2M' 这种短写法 —— 列目录时比原始字节数好扫一眼。"""
+    value = float(size)
+    unit = 0
+    while value >= 1024 and unit < len(_HUMAN_UNITS) - 1:
+        value /= 1024
+        unit += 1
+    digits = 0 if unit == 0 or value >= 100 else 1
+    return f"{value:.{digits}f}{_HUMAN_UNITS[unit]}"
+
+
+def _walk_tree(
+    base: Path,
+    *,
+    depth: int,
+    include_hidden: bool,
+    skip_dirs: frozenset[str],
+    limit: int,
+) -> tuple[list[str], int, int, bool]:
+    """按层的顺序铺出目录树，返回 (行文本, 目录数, 文件数, 是否撞到上限)。
+
+    用 os.walk 的 topdown 剪枝而不是 Path.rglob：后者没法在中途砍掉整个子树，
+    撞上一个塞满文件的 node_modules 就得先把几万个 path 对象都造出来。
+    """
+    lines: list[str] = []
+    dirs_seen = 0
+    files_seen = 0
+    capped = False
+
+    for root, dirnames, filenames in os.walk(base):
+        here = Path(root)
+        level = len(here.parts) - len(base.parts)
+        if level >= depth:
+            dirnames[:] = []  # 已经到倒数第二层，孙子辈不再进入
+            continue
+
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if (include_hidden or not d.startswith(".")) and d not in skip_dirs
+        )
+        filenames = sorted(f for f in filenames if include_hidden or not f.startswith("."))
+
+        # 缩进 = 层级：根的儿子在 0 缩进，孙子在 2 空格，以此类推。
+        # 目录名由**父亲**在自己那一级列出（这样被上限截断时至少知道有这个目录），
+        # 递归进来只补它的孩子 —— 再打一次自己的名字就会出现重名两行。
+        pad = "  " * level
+        # 目录优先：模型得先知道"有哪些子目录"，才好决定往哪儿钻
+        lines.extend(f"{pad}{name}/" for name in dirnames)
+        # 计数照实累加（哪怕马上要被上限截断）：尾巴被砍了，head 里的
+        # "共 N 个子目录 / M 个文件"仍然是真的总数
+        dirs_seen += len(dirnames)
+        files_seen += len(filenames)
+        lines.extend(f"{pad}{name}" for name in filenames)
+
+        if len(lines) >= limit:
+            lines = lines[:limit]
+            capped = True
+            break
+
+    return lines, dirs_seen, files_seen, capped
+
+
+def workspace_brief(root: Path, *, depth: int = 2, max_lines: int = 40) -> str:
+    """一段"你现在站在哪儿"的说明，给 system prompt 用。
+
+    为什么要加这一段：模型的 system prompt 里原来一行路径都没有，它开局是瞎的
+    —— 要么先浪费一整轮去 list_dir 探路，要么干脆凭空猜文件名（猜错的代价是
+    工具报错、用户看到一轮废话）。把浅层目录结构直接塞进 system prompt，
+    它第一句话就能说到点子上。
+
+    刻意做得**浅**（默认 2 层、40 行）：这是每一轮都要付的固定开销，再多点就是
+    给每次回答悄悄加了一份房租。要深的结构，模型自己会调 list_dir。
+
+    目录不存在 / 读不动就返回空串 —— 环境说明掉了不影响对话，绝不在这里抛。
+    """
+    if not root.is_dir():
+        return ""
+    try:
+        lines, dirs_seen, files_seen, capped = _walk_tree(
+            root,
+            depth=depth,
+            include_hidden=False,
+            skip_dirs=_SKIP_DIRS,
+            limit=max_lines + 2,  # 多取两行用来判断"是不是被截了"
+        )
+    except OSError:
+        return ""
+
+    head = f"当前工作目录：{root}"
+    if not lines:
+        return f"{head}\n（下面没有可见条目）"
+
+    truncated = capped or len(lines) > max_lines
+    lines = lines[:max_lines]
+    body = "\n".join(lines)
+    summary = f"（{dirs_seen} 个子目录 / {files_seen} 个文件，depth={depth}"
+    summary += "，下面还有更多" if truncated else ""
+    summary += "）"
+    return f"{head}\n```\n{body}\n```\n{summary}\n附上这段 tree 只是让你开局有方位感；细节请调 list_dir / glob / grep 现查。"
+
+
+async def _list_dir(args: dict, rt: ToolRuntime) -> str:
+    raw = str(args.get("path") or "").strip() or "."
+    base = _resolve(raw, rt)
+    if base is None:
+        return err(_OUT_OF_ROOT.format(raw=raw, root=rt.root.as_posix()))
+    if not base.exists():
+        return err(f"目录不存在：{raw}")
+    if not base.is_dir():
+        return err(f"{raw} 是文件不是目录；要看它的内容请用 read_file")
+
+    depth = min(max(_as_int(args.get("depth"), 1), 1), _MAX_LIST_DEPTH)
+    # 默认不显示隐藏条目、也不显示 node_modules / __pycache__ 这类依赖目录：
+    # 它们一出场就把真正有用的几个名字挤到 _clip 的截断点外面去了。
+    include_hidden = _truthy(args.get("include_hidden"))
+    skip_dirs = frozenset() if _truthy(args.get("include_ignored")) else _SKIP_DIRS
+    limit = min(max(_as_int(args.get("max_results"), 0) or rt.max_results, 1), _MAX_LIST_ENTRIES)
+
+    lines, dirs_seen, files_seen, capped = _walk_tree(
+        base, depth=depth, include_hidden=include_hidden, skip_dirs=skip_dirs, limit=limit
+    )
+    shown_root = _display(base, rt)
+    if not lines:
+        # 真的是空目录，还是"有东西但全被过滤掉了"—— 这两件事对模型来说下一步
+        # 完全不同（前者该收工，后者该改参数重试），必须写清楚。
+        why = "（它本身是空的）" if not any(base.iterdir()) else "（可能都是隐藏目录或依赖目录，可试 include_hidden / include_ignored）"
+        return f"{shown_root} 下没有可显示的条目{why}"
+
+    head = f"{shown_root}（{dirs_seen} 个子目录，{files_seen} 个文件，depth={depth}"
+    if not include_hidden:
+        head += "，跳过隐藏条目"
+    if skip_dirs:
+        head += "，跳过依赖/构建目录"
+    head += "）"
+    tail = ""
+    if capped:
+        tail = f"\n…（已达 {limit} 条上限，目录里可能还有更多）"
+    return _clip(head + "\n" + "\n".join(lines) + tail, rt.max_bytes, what="目录树")
 
 
 async def _grep(args: dict, rt: ToolRuntime) -> str:
@@ -753,10 +900,34 @@ _SPECS: tuple[NativeTool, ...] = (
         kind="read",
     ),
     NativeTool(
+        name="list_dir",
+        description=(
+            "列出一个目录里的内容（子目录带 `/` 后缀，排在文件前面）。"
+            "**回答「这里有什么 / 项目长什么样」时先调它**，再决定读哪个文件 —— "
+            "glob 只能按名字找、而且看不见空目录。"
+            "depth 可调（默认 1 层，最多 3 层）。默认过滤隐藏条目与 node_modules、"
+            "__pycache__ 等依赖/构建目录，想看全就传 include_hidden / include_ignored。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目录路径，默认工作目录"},
+                "depth": {"type": "integer", "description": "递归几层，默认 1，最多 3"},
+                "include_hidden": {"type": "boolean", "description": "是否显示 . 开头的条目，默认 false"},
+                "include_ignored": {"type": "boolean", "description": "是否显示 node_modules 等依赖目录，默认 false"},
+                "max_results": {"type": "integer", "description": "最多列多少条，默认 200"},
+            },
+            "required": [],
+        },
+        handler=_list_dir,
+        kind="search",
+    ),
+    NativeTool(
         name="glob",
         description=(
             "按文件名/通配符找文件，返回按修改时间倒序的路径列表。"
-            "支持 `**` 递归（如 `**/*.py`、`src/**/*.ts`）。要按内容找请用 grep。"
+            "支持 `**` 递归（如 `**/*.py`、`src/**/*.ts`）。要按内容找请用 grep，"
+            "要看目录结构（包括空目录）请用 list_dir。"
         ),
         parameters={
             "type": "object",
@@ -891,8 +1062,8 @@ ALL_TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in _SPECS)
 TOOL_PROFILES: dict[str, tuple[str, ...]] = {
     "native": ALL_TOOL_NAMES,
     "all": ALL_TOOL_NAMES,
-    "read_only": ("read_file", "glob", "grep"),
-    "ro": ("read_file", "glob", "grep"),
+    "read_only": ("read_file", "list_dir", "glob", "grep"),
+    "ro": ("read_file", "list_dir", "glob", "grep"),
     "off": (),
     "none": (),
 }

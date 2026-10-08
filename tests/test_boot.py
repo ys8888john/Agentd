@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -237,3 +238,234 @@ def test_build_llm_zhipu_without_key_raises(monkeypatch):
     _zhipu_env(monkeypatch)
     with pytest.raises(ValueError, match="AGENTD_ZHIPU_API_KEY"):
         build_llm()
+
+
+# ---- LiveLLM 热加载（provider / key / model / base_url 改了下一轮即用，不用重启）----
+
+
+def test_live_llm_hot_reload(tmp_path, monkeypatch):
+    """改 .env 或 RUNTIME_CONFIG.set 都能在下一轮对话生效；缺 key 抛错由内核转 ErrorEvent。"""
+
+    from agentd.boot import LiveLLM, RUNTIME_CONFIG
+    from agentd.kernel.llm import FakeLLM, OpenAICompatLLM
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENTD_LLM_BACKEND=fake\nAGENTD_FAKE_REPLY=hi\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTD_DOTENV", str(env_file))
+    RUNTIME_CONFIG.clear()  # 隔离其它测试可能留下的覆盖层
+
+    try:
+        live = LiveLLM()
+
+        # 启动：从 .env 读到 fake
+        assert isinstance(live._resolve(), FakeLLM)
+
+        # 程序化切换：RUNTIME_CONFIG.set -> 下一轮应是 openai_compat
+        RUNTIME_CONFIG.set(
+            backend="openai_compat",
+            openai_base_url="http://x/v1",
+            openai_model="q",
+            openai_api_key="k",
+        )
+        swapped = live._resolve()
+        assert isinstance(swapped, OpenAICompatLLM)
+        assert swapped.base_url == "http://x/v1"
+        # 同一轮内配置没变 -> 复用同一实例（Ollama 模型解析缓存等状态得以保留）
+        assert live._resolve() is swapped
+
+        # 改 .env 文件（不重启）：下一轮应自动热加载 zhipu
+        env_file.write_text(
+            "AGENTD_LLM_BACKEND=zhipu\nAGENTD_ZHIPU_API_KEY=id.secret\n",
+            encoding="utf-8",
+        )
+        RUNTIME_CONFIG.clear()
+        zhipu = live._resolve()
+        assert isinstance(zhipu, OpenAICompatLLM)
+        assert zhipu.base_url == "https://open.bigmodel.cn/api/paas/v4"
+
+        # 缺 key 不应让进程崩，抛 ValueError 即可（内核 handle() 会转成 ErrorEvent）
+        RUNTIME_CONFIG.set(backend="mimo")  # 不给 key
+        with pytest.raises(ValueError, match="AGENTD_MIMO_API_KEY"):
+            live._resolve()
+    finally:
+        RUNTIME_CONFIG.clear()
+
+
+def test_build_kernel_returns_live_llm(monkeypatch):
+    """build_kernel 现在返回热加载包装，provider 改了下一轮即用。"""
+    from agentd.boot import LiveLLM, build_kernel
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_LLM_BACKEND", "fake")
+    assert isinstance(build_kernel().llm, LiveLLM)
+
+
+def test_hotenv_carries_the_token_budget(tmp_path, monkeypatch):
+    """token 预算必须能跟着 GUI 的 profile 一起热切换 —— 这是把预算做成
+    **per-profile** 之后唯一真正重要的验收点。
+
+    GUI 里每个模型配置各带一份 AGENTD_MAX_*_TOKENS，切模型时整组写进 hotenv.json；
+    agentd 每轮 current_settings() 从那儿读。要是这条通路断了，症状是
+    "切了本地小模型但预算还是云端那个 128k"，而且完全不会有报错。
+    """
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    for key in ("AGENTD_MAX_CONTEXT_TOKENS", "AGENTD_MAX_OUTPUT_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+    RUNTIME_CONFIG.clear()
+
+    hot = tmp_path / "hotenv.json"
+    hot.write_text(
+        json.dumps({
+            "AGENTD_LLM_BACKEND": "fake",
+            "AGENTD_MAX_CONTEXT_TOKENS": "8192",
+            "AGENTD_MAX_OUTPUT_TOKENS": "1024",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+
+    try:
+        s = current_settings()
+        assert s.max_context_tokens == 8192
+        assert s.max_output_tokens == 1024
+    finally:
+        RUNTIME_CONFIG.clear()
+
+
+def test_bad_token_budget_falls_back_instead_of_crashing(monkeypatch):
+    """预算配错（写成 "8k" 这种）不该让 agent 起不来 —— 兜回 0（不限）并留日志。
+
+    理由：预算是"优化项"，不是"能不能用"的前提。用户更该看到
+    "预算没生效"（可查），而不是"程序打不开"。
+    """
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_MAX_CONTEXT_TOKENS", "8k")
+    monkeypatch.setenv("AGENTD_MAX_OUTPUT_TOKENS", "-5")
+    RUNTIME_CONFIG.clear()
+
+    s = current_settings()
+    assert s.max_context_tokens == 0
+    assert s.max_output_tokens == 0
+
+
+def test_compact_ratio_defaults_to_80_and_is_clamped(monkeypatch):
+    """默认 80%（留出压缩这一步本身要花的余量），越界的值要夹住而不是静默失效。"""
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    RUNTIME_CONFIG.clear()
+    assert current_settings().compact_ratio == 80
+
+    # 热切换这类值走 RUNTIME_CONFIG（真实环境变量是**启动时**的快照，改不动）
+    RUNTIME_CONFIG.set(compact_ratio="300")
+    assert current_settings().compact_ratio == 100  # 夹住：写 300 等于永远不触发
+    RUNTIME_CONFIG.clear()
+
+
+def test_kernel_reads_the_budget_lazily(tmp_path, monkeypatch):
+    """自动压缩的预算必须**每轮重新问**，不能用启动时的死值。
+
+    GUI 的 token 上限是按模型 profile 热写的（本地 8b 与云端 GLM 差三倍以上），
+    定死了会变成"切到 128k 的模型、却还按 8k 的窗口在压缩"。
+    """
+    from agentd.boot import RUNTIME_CONFIG, build_kernel
+
+    hot = tmp_path / "hotenv.json"
+    hot.write_text(json.dumps({"AGENTD_MAX_CONTEXT_TOKENS": "4096"}), encoding="utf-8")
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+    monkeypatch.setenv("AGENTD_STORE", "memory")
+    RUNTIME_CONFIG.clear()
+    try:
+        kernel = build_kernel()
+        assert kernel.context_budget() == 4096
+        # GUI 切到另一个 profile：同一个内核对象下一轮就必须看到新值
+        RUNTIME_CONFIG.set(max_context_tokens="16384")
+        assert kernel.context_budget() == 16384
+    finally:
+        RUNTIME_CONFIG.clear()
+
+
+def test_summary_settings_have_sane_defaults(monkeypatch):
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    for key in ("AGENTD_SUMMARY_EVERY", "AGENTD_SUMMARY_RECALL"):
+        monkeypatch.delenv(key, raising=False)
+    RUNTIME_CONFIG.clear()
+
+    s = current_settings()
+    # 默认开着：用户要的就是"换个会话还认识我"，默认关等于没做
+    assert s.summary_every > 0
+    assert s.summary_recall > 0
+
+
+def test_current_settings_reads_hotenv_file(tmp_path, monkeypatch):
+    """GUI 写入的热配置文件是跨进程切换 provider/模型的主通道：
+
+    current_settings() 每轮都读它，所以改了下一轮即生效、不用重启 agentd 子进程。
+    缺失的键回落到 .env / 默认（不会因热文件只写了部分字段就炸）。
+    """
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    # 清掉所有可能干扰的真实环境变量
+    for key in (
+        "AGENTD_LLM_BACKEND", "AGENTD_FAKE_REPLY", "AGENTD_ZHIPU_API_KEY",
+        "AGENTD_OLLAMA_MODEL", "ZHIPU_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    RUNTIME_CONFIG.clear()  # 隔离其它测试可能留下的覆盖层
+
+    hot = tmp_path / "hotenv.json"
+    hot.write_text(
+        json.dumps({"AGENTD_LLM_BACKEND": "fake", "AGENTD_FAKE_REPLY": "from-hot-file"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+
+    try:
+        s = current_settings()
+        assert s.backend == "fake"
+        assert s.fake_reply == "from-hot-file"
+        # 热文件只写了部分字段：其余回落到默认值（不报错）
+        assert s.ollama_model == AUTO
+
+        # 改写热文件（不重启进程）：下一轮读取应反映新值
+        hot.write_text(
+            json.dumps({"AGENTD_LLM_BACKEND": "zhipu", "AGENTD_ZHIPU_API_KEY": "id.secret"}),
+            encoding="utf-8",
+        )
+        s2 = current_settings()
+        assert s2.backend == "zhipu"
+        assert s2.zhipu_api_key == "id.secret"
+        # 热文件没写的 zhipu model -> 回落默认 glm-4.5-air
+        assert s2.zhipu_model == "glm-4.5-air"
+
+        # 删掉热文件：回落到默认 backend（不再有热覆盖）
+        hot.unlink()
+        assert current_settings().backend == "ollama"
+    finally:
+        RUNTIME_CONFIG.clear()
+
+
+def test_current_settings_hotenv_beats_initial_env(tmp_path, monkeypatch):
+    """热配置文件档位高于启动时的真实环境变量（GUI 切换应覆盖启动时注入的配置）。"""
+    from agentd.boot import RUNTIME_CONFIG, current_settings
+
+    monkeypatch.setenv("AGENTD_DOTENV", "__nonexistent__")
+    monkeypatch.setenv("AGENTD_LLM_BACKEND", "ollama")  # 启动环境里是 ollama
+    RUNTIME_CONFIG.clear()
+
+    hot = tmp_path / "hotenv.json"
+    hot.write_text(json.dumps({"AGENTD_LLM_BACKEND": "zhipu"}), encoding="utf-8")
+    monkeypatch.setenv("AGENTD_HOTENV", str(hot))
+
+    try:
+        assert current_settings().backend == "zhipu"  # 热文件盖过启动环境
+    finally:
+        RUNTIME_CONFIG.clear()

@@ -44,12 +44,52 @@ class SessionStore(ABC):
     async def list_sessions(self) -> list[str]:
         """已有会话 ID，按创建时间升序。给"接着上次聊"的 UI 和运维脚本用。"""
 
+    @abstractmethod
+    async def save_summary(self, session_id: str, summary: str) -> None:
+        """记一段会话摘要（跨会话记忆的"摘要层"）。
+
+        同一个 session_id 反复调用是**更新**而不是追加：一个会话只保留最新的一份
+        压缩结果，中间版本的历史本身还在 messages 表里，不需要留两级。
+        """
+
+    @abstractmethod
+    async def save_compaction(self, session_id: str, summary: str, cut: int) -> None:
+        """记一次**上下文压缩**：摘要文本 + 窗口起点（``cut`` 条原始行已被压掉）。
+
+        与 :meth:`save_summary` 的区别：那是"为了将来能想起这次会话"，纯附加；
+        这条同时移动了 feed 给模型的窗口起点 —— 细节行一条不删，仍然躺在
+        ``messages`` 里可以被 UI 完整回放，只是不再进 LLM 上下文。
+
+        ``cut`` 单调向前：宁可重复写同一个值，也不能让窗口退回去（退回去等于把已经
+        压过的对话重新灌回上下文，压缩就白做了）。
+        """
+
+    @abstractmethod
+    async def compaction(self, session_id: str) -> tuple[str, int]:
+        """读回一次压缩的结果：``(摘要, 窗口起点)``；没压过是 ``("", 0)``。
+
+        摘要要能被本会话自己读到 —— 窗口之外的那些对话如果没有替代品，
+        模型的视野里就真的什么都不剩了。
+        """
+
+    @abstractmethod
+    async def recent_summaries(
+        self, limit: int = 8, *, exclude: str | None = None
+    ) -> list[tuple[str, str]]:
+        """最近若干个会话的摘要，按时间升序（旧的在前）。
+
+        ``exclude`` 用来排除当前会话 —— 自己正在聊的内容已经在上下文里了，
+        再插一份自己的摘要纯属浪费。
+        """
+
 
 class InMemorySessionStore(SessionStore):
     """进程内存储，重启即丢。"""
 
     def __init__(self) -> None:
         self._sessions: dict[str, list[Message]] = {}
+        self._summaries: dict[str, str] = {}
+        self._compactions: dict[str, int] = {}
 
     async def create(self, session_id: str) -> None:
         self._sessions.setdefault(session_id, [])
@@ -76,6 +116,32 @@ class InMemorySessionStore(SessionStore):
 
     async def list_sessions(self) -> list[str]:
         return list(self._sessions)
+
+    async def save_summary(self, session_id: str, summary: str) -> None:
+        if not await self.exists(session_id):
+            raise UnknownSessionError(session_id)
+        self._summaries[session_id] = summary
+
+    async def save_compaction(self, session_id: str, summary: str, cut: int) -> None:
+        if not await self.exists(session_id):
+            raise UnknownSessionError(session_id)
+        if summary.strip():
+            self._summaries[session_id] = summary
+        self._compactions[session_id] = max(self._compactions.get(session_id, 0), cut)
+
+    async def compaction(self, session_id: str) -> tuple[str, int]:
+        return self._summaries.get(session_id, ""), self._compactions.get(session_id, 0)
+
+    async def recent_summaries(
+        self, limit: int = 8, *, exclude: str | None = None
+    ) -> list[tuple[str, str]]:
+        # 内存版没有"更新时间"概念，用写入顺序近似（dict 保序）
+        items = [
+            (sid, text)
+            for sid, text in self._summaries.items()
+            if sid != exclude and text.strip()
+        ]
+        return items[-limit:] if limit > 0 else []
 
 
 # ---- SQLite ----
@@ -105,6 +171,23 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages (session_id, seq);
+
+-- 跨会话记忆的"摘要层"：一个会话一段进展（细节还在 messages 表里）。
+-- 不删 messages：摘要是给上下文省空间的，原始记录仍要能被 UI 完整回放。
+CREATE TABLE IF NOT EXISTS summaries (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    summary     TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+-- 自动压缩的水位："这个会话给模型的窗口从第几条原始行开始"。
+-- 独立一张表而不是给 summaries 加列：老库在建表时自动补上 IF NOT EXISTS 的新表，
+-- 而 ALTER TABLE 要处理"这一列到底加过没有"，为一个 int 不值得。
+CREATE TABLE IF NOT EXISTS compactions (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    cut         INTEGER NOT NULL,
+    updated_at  REAL NOT NULL
+);
 """
 
 
@@ -208,6 +291,68 @@ class SqliteSessionStore(SessionStore):
         ).fetchall()
         return [row[0] for row in rows]
 
+    def _save_summary_sync(self, session_id: str, summary: str) -> None:
+        if not self._exists_sync(session_id):
+            raise UnknownSessionError(session_id)
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO summaries (session_id, summary, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, "
+                "updated_at=excluded.updated_at",
+                (session_id, summary, time.time()),
+            )
+
+    def _save_compaction_sync(self, session_id: str, summary: str, cut: int) -> None:
+        if not self._exists_sync(session_id):
+            raise UnknownSessionError(session_id)
+        now = time.time()
+        with self._conn:  # 一个事务：摘要与水位要么都生效，要么都不生效
+            if summary.strip():
+                self._conn.execute(
+                    "INSERT INTO summaries (session_id, summary, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, "
+                    "updated_at=excluded.updated_at",
+                    (session_id, summary, now),
+                )
+            # MAX(...) 而不是直接覆盖：水位只许向前。
+            # 两条并发的压缩请求（不同会话被并行 handle 时不会出现，这里是防守写法）
+            # 谁也不许把窗口往回拖。
+            self._conn.execute(
+                "INSERT INTO compactions (session_id, cut, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET cut=MAX(cut, excluded.cut), "
+                "updated_at=excluded.updated_at",
+                (session_id, cut, now),
+            )
+
+    def _compaction_sync(self, session_id: str) -> tuple[str, int]:
+        row = self._conn.execute(
+            "SELECT summary FROM summaries WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        cut_row = self._conn.execute(
+            "SELECT cut FROM compactions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return (row[0] if row else ""), int(cut_row[0]) if cut_row else 0
+
+    def _recent_summaries_sync(
+        self, limit: int, exclude: str | None
+    ) -> list[tuple[str, str]]:
+        if limit <= 0:
+            return []
+        rows = self._conn.execute(
+            "SELECT session_id, summary FROM summaries "
+            "WHERE summary <> '' ORDER BY updated_at DESC, session_id LIMIT ?",
+            (limit + (1 if exclude else 0),),
+        ).fetchall()
+        # SQL 里 ORDER BY DESC 是为了"取最近 N 条"，但给模型看要从旧到新，
+        # 这样它读到的顺序跟时间线一致，叙事才有逻辑。
+        items = [
+            (str(sid), text)
+            for sid, text in rows
+            if sid != exclude and (text or "").strip()
+        ]
+        items.reverse()
+        return items[:limit]
+
     # -- SessionStore 接口 --
 
     async def create(self, session_id: str) -> None:
@@ -227,6 +372,22 @@ class SqliteSessionStore(SessionStore):
 
     async def list_sessions(self) -> list[str]:
         return await asyncio.to_thread(self._call, self._list_sessions_sync)
+
+    async def save_summary(self, session_id: str, summary: str) -> None:
+        await asyncio.to_thread(self._call, self._save_summary_sync, session_id, summary)
+
+    async def save_compaction(self, session_id: str, summary: str, cut: int) -> None:
+        await asyncio.to_thread(
+            self._call, self._save_compaction_sync, session_id, summary, cut
+        )
+
+    async def compaction(self, session_id: str) -> tuple[str, int]:
+        return await asyncio.to_thread(self._call, self._compaction_sync, session_id)
+
+    async def recent_summaries(
+        self, limit: int = 8, *, exclude: str | None = None
+    ) -> list[tuple[str, str]]:
+        return await asyncio.to_thread(self._call, self._recent_summaries_sync, limit, exclude)
 
     # -- 生命周期 --
 

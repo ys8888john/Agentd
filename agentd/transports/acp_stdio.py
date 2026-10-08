@@ -36,6 +36,7 @@ from ..contracts import (
     ErrorEvent,
     MessageDelta,
     MessageDone,
+    Notice,
     ThoughtDelta,
     ToolCallDone,
     ToolCallStart,
@@ -52,6 +53,10 @@ _STOP_REASON_MAP = {
     # 执行出错：错误内容已经通过 thought 通道告知客户端，这里按正常收尾
     "error": "end_turn",
 }
+
+# error 通道借用见上；Notice 同理走 thought，靠这个前缀让客户端区分。
+# ⚠️ 跨仓库契约：ForgeAgent-GUI 的 acp_client.NOTICE_MARK 必须与之一致。
+_NOTICE_MARK = "[提示] "
 
 # 内核的 kind/status 取值与 ACP schema 不完全重合，映射一下才合法：
 #   ACP ToolKind   = read|edit|delete|move|search|execute|think|fetch|switch_mode|other
@@ -320,6 +325,17 @@ class AgentdAcpAgent(Agent):
                     # ACP 没有"整条消息"事件，客户端靠累积 chunk 自己拼。
                     # 我们多留一份 MessageDone 是给内核自己和未来的 HTTP 调试口用的。
                     pass
+
+                elif isinstance(event, Notice):
+                    # ACP 没有"系统提示"通道，只能复用 thought（跟 ErrorEvent 同路）。
+                    # 用前缀让客户端能把它跟模型自己的思考分开。
+                    # ⚠️ [提示] 是跨仓库契约：GUI 的 acp_client.NOTICE_MARK 与之对应。
+                    #   两边不一致时最坏退化为普通思考文本，不会崩。
+                    self._log(f"[agentd] {event.text}")
+                    await self._conn.session_update(
+                        session_id,
+                        update_agent_thought_text(f"{_NOTICE_MARK}{event.text}"),
+                    )
 
                 elif isinstance(event, ErrorEvent):
                     # 没有 error 这个 stop_reason，把错误内容送进 thought 通道，

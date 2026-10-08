@@ -1,21 +1,64 @@
 # Agentd
 
 ACP（[Agent Client Protocol](https://agentclientprotocol.com)）native 的 agent 内核。
-对外就是一个 stdio 上的 JSON-RPC 服务，[ForgeAgent-GUI](../ForgeAgent-GUI) 之类的客户端
-通过 stdio 把它拉起来对话。
+**三个等价入口**共用同一个内核（建会话 / 续聊 / 流式对话 / 切模式 / 叫停 / 工具审批 / 历史），
+差别只在"怎么和外面说话"：
+
+| 入口 | 命令 | 协议 | 谁用 |
+|---|---|---|---|
+| ACP | `python -m agentd` | stdio / JSON-RPC | Zed、[ForgeAgent-GUI](../ForgeAgent-GUI) 之类的 ACP 客户端 |
+| Gateway | `python -m agentd gateway` | HTTP + SSE | 浏览器 / curl / 任何能读 SSE 的东西 |
+| CLI | `python -m agentd cli` | 终端交互 | 人在终端里直接聊天 |
 
 ```
-ForgeAgent-GUI ──stdio/JSON-RPC──> agentd ──HTTP──> Ollama / OpenAI 兼容端点
+ForgeAgent-GUI ──stdio/JSON-RPC──┐
+curl / 浏览器  ──HTTP+SSE───────┤──> agentd ──HTTP──> Ollama / OpenAI 兼容端点
+人（终端）      ──命令行────────┘
 ```
+
+"功能一致"是**结构性**保证的，不是三份代码各写一遍：三入口的会话语义
+（模式覆盖 / 取消信号 / "本会话总是允许"的审批记忆）都收在
+`transports/runtime.py` 的 `SessionRuntime`，各入口只负责"怎么问用户"。
 
 ## 跑起来
 
 ```bash
 pip install -e .
-python -m agentd.server      # 之后什么都不显示是正常的：它在等 JSON-RPC 帧
+
+# ACP（默认，等 JSON-RPC 帧，单跑没输出是正常的）
+python -m agentd
+
+# Gateway：HTTP + SSE，只绑 127.0.0.1，端口随机；SSE 在 /v1/sessions/<id>/stream
+python -m agentd gateway --port 8765
+
+# CLI：终端里直接聊天（:help 看命令，:quit 退出）
+python -m agentd cli
 ```
 
-单独跑没意义（它是给人看不见的协议端点用的），配前端才有输出。
+也装了三个 console script：`agentd` / `agentd-gateway` / `agentd-cli`。
+
+### Gateway 的一轮对话长什么样
+
+```bash
+# 1) 建会话
+curl -s localhost:8765/v1/sessions -H 'content-type: application/json' -d '{"cwd":"."}'
+# → {"ok":true,"session_id":"sess_…","modes":["agent","single"]}
+
+# 2) 订阅 SSE（一个会话一条流，多轮复用），另开一个终端发消息
+curl -N localhost:8765/v1/sessions/sess_…/stream
+curl -s localhost:8765/v1/sessions/sess_…/prompt \
+  -H 'content-type: application/json' -d '{"text":"你好"}'
+
+# SSE 里会收到 message_delta / thought_delta / tool_call_start / tool_call_done / done，
+# 与 ACP 的 session/update 语义一一对应。
+
+# 工具要审批时，流里会推一条 permission_request：
+curl -s localhost:8765/v1/sessions/sess_…/permission \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"perm_…","option_id":"allow_once"}'   # allow_once|allow_session|reject
+
+# 其它：POST …/cancel 叫停、POST …/mode {"mode_id":"single"} 切模式、GET …/history 看历史
+```
 
 ## 配置
 
@@ -40,6 +83,12 @@ python -m agentd.server      # 之后什么都不显示是正常的：它在等 
 | `AGENTD_SCRIPT_JSON` | `script` 后端的回放脚本（内联 JSON，优先） | 空 |
 | `AGENTD_SCRIPT_FILE` | `script` 后端的回放脚本（文件路径） | 空 |
 | `AGENTD_SYSTEM_PROMPT` | 系统提示词 | 空 |
+| `AGENTD_MAX_CONTEXT_TOKENS` | 上下文预算（历史消息上限，system/tools 另算）；`0`=不限 | `0` |
+| `AGENTD_MAX_OUTPUT_TOKENS` | 单次回答的最大 token；`0`=交给后端默认 | `0` |
+| `AGENTD_COMPACT_RATIO` | 占用到预算的百分之几就自动压缩；`0`=只保留溢出时的裁剪 | `80` |
+| `AGENTD_SUMMARY_EVERY` | 多少条消息压一次摘要+抽一次事实；`0`=关闭跨会话记忆 | `20` |
+| `AGENTD_SUMMARY_RECALL` | 新会话带几条历史摘要 | `6` |
+| `AGENTD_MEMORY_FILE` | 长期事实文件（可直接手改的 Markdown） | `~/.agentd/memory.md` |
 | `AGENTD_STORE` | `sqlite` / `memory` | `sqlite` |
 | `AGENTD_DB_PATH` | SQLite 会话库位置 | `~/.agentd/sessions.db` |
 | `AGENTD_TOOLS` | 原生工具范围：`native` / `read_only` / `off` | `native` |
@@ -120,6 +169,41 @@ python -m agentd.server
 ```bash
 AGENTD_LIVE_ZHIPU=1 AGENTD_ZHIPU_API_KEY=xxxx.yyyy pytest tests/test_zhipu_live.py -v
 ```
+
+### provider 热加载：改后端不用重启
+
+provider / key / model / base_url 这一类「可能随时改」的配置，走的是**热加载**——
+内核持有一个 `LiveLLM` 包装，每轮对话开始前按「当前」配置重建底层后端，于是切换
+provider 在**下一轮对话**即生效，不用重启进程。
+
+两种触发方式，另加一条 GUI 通道（三档优先级）：
+
+1. **GUI 热配置文件**（ForgeAgent-GUI 切模型专用，**不重启 agentd**）：GUI 切换
+   provider / 模型时，把选中的 profile 环境变量写进一个 JSON 文件，路径由启动时的
+   `AGENTD_HOTENV` 环境变量指定（GUI 默认指向它自己管理的 `~/.forgeagent/hotenv.json`；
+   非 GUI 场景缺省回落 `~/.agentd/hotenv.json`）。`current_settings()` 每轮都读它，于是
+   **运行中的 agentd 下一轮即用，子进程完全不用重启**——会话历史 / 工具循环 / 已加载的
+   MCP 全都不用重建。这是前端「会话中随时切模型」的主通道。
+
+2. **直接改 `.env`**：`current_settings()` 每轮都重新解析 `.env` 文件，改完下一轮自动生效。
+   优先级是 `启动时的真实环境变量 > 重新解析的 .env > 代码默认`，所以进程外
+   `export` 的环境变量依旧最优先、且不会被 `..env` 覆盖（保留了「CI 里误提交的 `.env`
+   改不掉行为」这条不变式）。
+
+3. **程序化切换**（未来的 admin 命令 / GUI 按钮可用）：
+
+   ```python
+   from agentd.boot import RUNTIME_CONFIG
+   RUNTIME_CONFIG.set(backend="mimo", mimo_api_key="sk-...")   # 下一轮切到 MiMo
+   RUNTIME_CONFIG.clear()                                       # 清回 .env 的值
+   ```
+
+完整优先级（逐档回落）：
+`RUNTIME_CONFIG.overrides  >  GUI 热配置文件  >  启动时的真实环境变量  >  重新解析的 .env  >  代码默认`。
+
+缺 key / 未知后端时，重建会在该轮抛出 `ValueError`，由内核 `handle()` 统一转成
+`ErrorEvent`（不会让整轮对话挂掉）。注意：**store 路径、工具策略、审批策略这类结构性
+配置仍是启动定死**，热加载它们会带来数据/安全风险，不在本次范围内。
 
 ## 模式：single / agent
 
@@ -259,11 +343,137 @@ messages(seq, session_id, role, content, name, payload, created_at)
 存在的唯一理由是让人能用 `sqlite3` 直接看库、用 SQL 统计，而不是每次都写脚本解 JSON。
 将来给 `Message` 加字段也不用迁移表。
 
-除了 user / assistant 两种行，还有 `role="tool_record"`：每张完成的工具卡片一条
-（call_id/title/kind/status/output 全在 `payload.tool_record` 里，被拒绝的调用以
-`cancelled` 落库）。它是客户端历史回放用的 UI 记录 —— 内核加载 history 时会把
-这类行过滤掉，**永不进 LLM 上下文**；`role="tool"`（真正的工具结果消息）只存在于
-单轮执行过程里，不落库。
+除了 user / assistant 两种行，还有：
+
+- `role="tool_record"`：每张完成的工具卡片一条
+  （call_id/title/kind/status/output 全在 `payload.tool_record` 里，被拒绝的调用以
+  `cancelled` 落库）。它是客户端历史回放用的 UI 记录 —— 内核加载 history 时会把
+  这类行过滤掉，**永不进 LLM 上下文**；
+- `role="tool"` 与「带 `tool_calls` 的 assistant」：模型与工具的一次完整往返。
+  它们**也落库** —— 不落的话，下一轮模型就不知道自己上一步读过什么文件，
+  "继续改"之类的追问必然答非所问；内核加载 history 时会先做一次
+  `sanitize_history()`，把被中途叫停而残缺的往返（举手要调工具却没有结果，
+  或反过来）整段丢掉 —— 那是 OpenAI 兼容端点 4xx 的经典来源。
+
+第三张表是跨会话记忆的**摘要层**：
+
+```
+summaries(session_id, summary, updated_at)   -- 一个会话一段进展，反复压缩是覆盖
+compactions(session_id, cut, updated_at)     -- 上下文窗口起点（第几条原始行之后才进上下文）
+```
+
+细节始终留在 `messages` 里，摘要只用来给上下文省空间；UI 回放仍走完整历史。
+`cut` 只许往前 —— 往回退等于把刚压过的对话重新灌回上下文。
+
+## 上下文：token 预算、裁剪与跨会话记忆
+
+三件事共用一条链路（`store.history()` → `sanitize_history()` → 模式 → `LiveLLM`），
+解决的是同一个症状的不同侧面：**"聊着聊着模型变笨 / 换会话像第一次见面"**。
+
+- **token 估算**：先得知道占了多少；
+- **自动压缩**（占 80% 就动手）：把较早的对话压成摘要，**留一份信息**再缩小窗口；
+- **裁剪**（真溢出了才发生）：从最早的开始丢，此时也保证了
+  「首轮提问 + 本轮提问」还在。
+
+后两者的区别值得强调：压缩是"信息换位置"（原始行一条不删，UI 回放照旧完整），
+裁剪是"信息换预算"（丢掉的就真的没了）。所以压缩必须排在前面。
+
+### 自动压缩：到预算的 80% 就动手
+
+`AGENTD_COMPACT_RATIO`（默认 80；`0` = 关掉，只剩溢出时的裁剪）。为什么是提前
+这一截：
+
+- 压一次要**额外调一次模型**，预算已经见底时做这件事等于把最后一点空间也花掉；
+- 剩下那 20% 是留给"本轮提问 + 工具往返 + 模型回答"的周转空间。
+
+一次压缩做三件事：把较早的一段交给 `memory.compact()` 压成摘要 + 事实、把窗口
+起点往前推（`compactions` 表里的水位）、把这份摘要挂进 system prompt 替被移走的
+部分说话。三条安全约束和一个反向安全阀：
+
+- 切点必须落在工具往返的块边界上（水位会被持久化，切坏了要到下一轮才炸）；
+- 本轮提问所在的那一块永远不压；
+- 首轮 user 会从窗口外被救回来 —— 那里通常写着任务本身是什么；
+- **摘要没压出来就原地不动**：宁可这一轮多占一点预算，也不能把还没留下备份的
+  对话从上下文里抹掉。
+
+触发与否只看一件事：实际占用占预算的百分比；而 `used` 的计算要把 **system prompt
+和 tools schema** 一起算进去 —— 放着二十几个工具的 schema 不是小数，只数历史会在
+"预算看着还剩一半"时早就贴上限。MCP 的工具要连上 server 才知道有哪些，而连接是每轮
+开一次的重量级动作，这里只估原生工具；缺口由发请求前的裁剪兜底，那道必经。
+
+压缩后会发一条 `[提示]` 说明占用百分比和压了多少条 —— 悄悄跑和悄悄失败都只会让人
+以为"它突然忘了"。
+
+一个反向安全阀：`system prompt + tools schema` 是每轮都要付的固定开销，压不掉。
+如果它们单独就已经在触发线之上，再压缩历史也降不下来 —— 那样只会每轮白跑一次压缩
+（多一次 LLM 调用）而窗口一点没变小。内核识别出来就停手，并在 stderr 里留一句
+"请调大 `AGENTD_MAX_CONTEXT_TOKENS` 或关掉一部分工具"（每个会话一次）。
+
+### token 估算：刻意不引 tiktoken
+
+`kernel/context.py` 用字符比例估：CJK 按 1 字≈1 token、ASCII 按 4 字符≈1 token，
+乘 1.1 安全余量后向上取整。理由：
+
+- 各家词表差异在 20%~40%，谁也算不准本地小模型；
+- 为一个只能"估得更准一点"的数引一个依赖不值当；
+- 估不确定就**宁可高估**（×1.1）—— 估高了至多少放回几条历史，估低了会让
+  请求真的超出窗口，症状是后端截断 + 模型答非所问。
+
+### 裁剪：保尾弃头，永不切断工具往返
+
+超预算时从最早的开始丢，但两条硬约束：
+
+- 最后一块（本轮提问）**永远保留**；另外会额外抢救首轮 user —— 那里通常写着
+  任务本身是什么；
+- 「assistant(tool_calls) + 它引发的 tool 结果」是一个原子块。切开会让
+  `role="tool"` 变成孤儿消息，端点直接 4xx。
+
+实际上没有裁剪就**一声不出**（不会每轮刷一行系统提示让用户以为出了事）；
+裁了才发一条 `[提示]` 说明丢了几条。
+
+### 为什么不自动写 `num_ctx`
+
+`max_output_tokens` 会翻译成 Ollama 的 `options.num_predict` / OpenAI 的
+`max_tokens`，但 `num_ctx`（输入窗口）刻意不碰：只有使用者知道自己拉的模型是
+8k 还是 40k，替他猜一个必然错 —— 而且设小了 Ollama 会**真的按这个值截断输入**，
+症状跟"机器人变笨"一模一样，极难自查。要控输入量，就用 `max_context_tokens`
+明确地裁：裁了几条、为什么裁，都能对用户讲清楚。
+
+### 跨会话记忆：摘要层 + 事实层
+
+```
+        ┌──────────── 事实层 ~/.agentd/memory.md ────────────┐
+        │  - 偏好简体中文                                     │
+        │  - 本机 Ollama 模型是 qwen3.5:9b                    │   稳定、手可改
+        └────────────────────────────────────────────────────┘
+                     ↑ compact() 抽出来的"跨会话仍成立"的事实
+                     │
+一段久到够线  ────────┤
+的对话 rows           │
+                     ↓ compact() 压出来的"这段聊到哪了"
+        ┌──────────── 摘要层 summaries 表 ───────────────────┐
+        │  sess_a → 上次在给 memory.py 写测试                 │   按会话归档的进展
+        │  sess_b → token 预算先用 8192 试                    │
+        └────────────────────────────────────────────────────┘
+
+        新会话的 system prompt = 事实（永远相关）+ 最近 N 条摘要（按需相关）
+```
+
+两层为什么要都有：只有摘要，十次之后摘要自己也有几万字，而且"用户是个什么样的
+开发者"每次被重总结一遍、措辞次次不同；只有事实，对话过程全丢，"上次做到哪儿了"
+照样答不上来。
+
+三个不太显然的决定：
+
+- **压缩发生在"下一轮开头"，不是轮末。** 传输层拿到 `Done` 就收工了，跟在最后一个
+  `yield` 后面的代码不保证会跑到 —— 放在轮末等于"记忆看心情"，也不可单测。
+- **只压上次没压过的那一段。** 全文重压会让压缩开销随会话长度平方增长，
+  那正是"为了省上下文而反被上下文吃掉"。
+- **压失败了静默但留日志。** 让一轮对话挂掉去换一份记忆，这笔买卖不划算；
+  但也不能完全无声 —— "它为什么像第一次见我"必须有线素可查。
+
+事实层刻意做成**可以直接打开改的 Markdown**："它记错了我的编辑器"这种事，
+让用户去写 SQL 是不人道的。手动删改立即生效，写错也不会让对话失败。
 
 ### 三个实现决定
 

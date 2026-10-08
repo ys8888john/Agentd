@@ -26,8 +26,8 @@ import json
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
-from ...contracts import Event, MessageDelta, MessageDone, ThoughtDelta, ToolCallDone, ToolCallStart
-from ..llm import LLMText, LLMThought, LLMToolCall
+from ...contracts import Event, MessageDelta, MessageDone, Notice, ThoughtDelta, ToolCallDone, ToolCallStart
+from ..llm import LLMNotice, LLMText, LLMThought, LLMToolCall
 from ..mcp import McpHub, ToolBinding
 from ..models import Message, ToolCall
 from ..tools import ERROR_PREFIX, ApprovalRequest, NativeTool, needs_approval
@@ -101,6 +101,11 @@ class AgentMode(Mode):
                             yield ThoughtDelta(
                                 session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
                             )
+                        elif isinstance(event, LLMNotice):
+                            # "上下文超预算已裁剪"之类：系统自己的话，不进正文、不落库
+                            yield Notice(
+                                session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                            )
                         elif isinstance(event, LLMToolCall):
                             calls.append(event)
 
@@ -124,23 +129,29 @@ class AgentMode(Mode):
                     yield MessageDone(session_id=ctx.session_id, run_id=ctx.run_id, text=text)
                     return
 
-                # assistant 的这轮"举手要调工具"要记进消息历史，模型下一轮才看得到
-                messages.append(
-                    Message(
-                        role="assistant",
-                        content=text,
-                        tool_calls=[
-                            ToolCall(id=c.id, name=c.name, arguments=c.arguments) for c in calls
-                        ],
-                    )
+                # assistant 这一轮"举手要调工具"必须记进消息历史 ——
+                # 而且要让内核落库（yield 出去即可，内核会吃掉并持久化）：
+                # 续聊时重建上下文缺了它，后面那些 role="tool" 就成了孤儿，
+                # OpenAI 兼容端点会因为"没有对应 tool_call 的 tool 消息"直接 4xx。
+                announce = Message(
+                    role="assistant",
+                    content=text,
+                    tool_calls=[
+                        ToolCall(id=c.id, name=c.name, arguments=c.arguments) for c in calls
+                    ],
                 )
+                messages.append(announce)
+                yield announce
 
                 for call in calls:
                     if ctx.cancelled():
                         break
                     async for event in self._dispatch(ctx, hub, call):
                         if isinstance(event, Message):
+                            # 工具结果也是同样的两条路：append 进本地列表让本轮
+                            # 的 LLM 立刻看到，yield 出去让内核落库留给下一轮。
                             messages.append(event)
+                            yield event
                         else:
                             yield event
 

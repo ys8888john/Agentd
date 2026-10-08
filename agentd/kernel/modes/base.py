@@ -70,4 +70,16 @@ class Mode(ABC):
     name: ClassVar[str] = ""
 
     @abstractmethod
-    async def run(self, ctx: ModeContext, user_input: str) -> AsyncIterator[Event]: ...
+    async def run(
+        self, ctx: ModeContext, user_input: str
+    ) -> AsyncIterator[Event | Message]:
+        """执行一次并返回事件流；可以夹带若干 :class:`Message`。
+
+        为什么要允许夹带 Message：模式知道"这轮到底发生了什么"（调了哪些工具、
+        工具返回了什么），而**持久化由内核统一负责**（见 ModeContext 的注释）。
+        夹带出来就让内核落库，下一轮重建上下文时模型才看得到这些工具往返 ——
+        否则 history 里只剩"用户问了什么 / 助手答了什么"两行，模型再被问到
+        "刚才那个文件里写的什么"时，它压根不知道自己曾经读过文件。
+
+        内核会把 Message 吃掉（不外发给传输层），传输层因此可以完全不认识它。
+        """

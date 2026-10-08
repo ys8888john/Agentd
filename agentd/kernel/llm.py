@@ -65,6 +65,18 @@ class LLMThought:
     text: str
 
 
+@dataclass
+class LLMNotice:
+    """给客户端的一行系统提示（"上下文被裁了"之类）。
+
+    和 Thought 一样不进正文、不落库，但语义不同：Thought 是"模型在想什么"，
+    Notice 是"系统在做什么"。分开是为了让客户端能区别渲染 —— 把系统动作混进
+    模型思考里，用户会误以为是模型输出的一部分。
+    """
+
+    text: str
+
+
 class LLM:
     """内核只认这个接口。
 
@@ -82,6 +94,9 @@ class LLM:
         raise NotImplementedError
 
     async def stream(self, messages: list[Message], *, system: str | None = None) -> AsyncIterator[str]:
+        # 刻意只放正文：LLMNotice 是给终端用户看的系统提示，而走 stream()/complete()
+        # 的调用方里有**内核内部旁路**（比如记忆压缩）—— 那种场景里一句
+        # "上下文被裁了 N 条"要么没人消费，要么被当成内容写进摘要，两种都是错的。
         async for event in self.stream_events(messages, system=system):
             if isinstance(event, LLMText) and event.text:
                 yield event.text
@@ -343,11 +358,16 @@ class OpenAICompatLLM(LLM):
         model: str = "qwen3",
         api_key: str = "ollama",
         prefer: str = DEFAULT_PREFER,
+        max_tokens: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.prefer = prefer
+        # 0 = 不限制（交给后端自己的默认值）。设了就塞 max_tokens —— OpenAI 兼容
+        # 端点里这个名字是最通用的那个；max_completion_tokens 是新版替代品，
+        # 但 GLM / MiMo / vLLM 这些"兼容"端点对它的支持参差不齐，先不用它。
+        self.max_tokens = max_tokens
         self._resolved: str | None = None
 
     async def resolve_model(self) -> str:
@@ -379,6 +399,8 @@ class OpenAICompatLLM(LLM):
         }
         if tools:
             body["tools"] = tools
+        if self.max_tokens > 0:
+            body["max_tokens"] = self.max_tokens
         return body
 
     async def stream_events(
