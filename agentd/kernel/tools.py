@@ -330,6 +330,25 @@ _BLOCK_RX = re.compile(
     re.I,
 )
 _TAG_RX = re.compile(r"<[^>]+>")
+# head / body 整块定位：抽正文时先甩掉 head（否则 <title> 会混进正文），
+# 再从 body 里取；拿不到 body 才退化成整篇。
+_HEAD_RX = re.compile(r"<head\b[^>]*>.*?</head\s*>", re.S | re.I)
+_BODY_RX = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", re.S | re.I)
+
+# 很多资讯站（头条 / 各种 SPA）首屏 HTML 里**正文一个字都没有**，全是 JS：
+# 剥完 script 只剩空 body，于是 `<title>` 和 meta 描述成了唯一的可读信息。
+# 这两条在 <head> 里、script 之外，剥完标签后不单独捞就会被连 body 一起丢掉。
+_DOC_TITLE_RX = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_META_RX = re.compile(r"<meta\b[^>]*>", re.I)
+# meta description / og:description 的属性顺序不固定，所以按 name/property
+# 单独匹配再取 content，别指望一条正则同时吃下 content 在前的写法。
+_META_DESC_NAME_RX = re.compile(
+    r'<meta\b[^>]*\b(?:name|property)\s*=\s*["\']?\s*'
+    r'(?:description|og:description|twitter:description)\s*["\']?[^>]*>',
+    re.I,
+)
+_META_DESC_CONTENT_RX = re.compile(
+    r'\bcontent\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
 
 # Bing 结果页的形状（实测）：结果都在 `<li class="b_algo">` 块里，
 # 标题+链接是块内第一个 h2>a，摘要是块内第一个 <p>。
@@ -442,14 +461,55 @@ def _parse_bing(page: str, limit: int) -> tuple[list[dict], str]:
     return results, _text_of(count_hit.group(1)) if count_hit else ""
 
 
-def _html_to_text(raw: str) -> str:
-    """把 HTML 折成可读纯文本。
+def _doc_title(raw: str) -> str:
+    """从 <head> 里捞 <title> 文本（没有就返回空串）。"""
+    m = _DOC_TITLE_RX.search(raw)
+    return _text_of(m.group(1)) if m else ""
 
-    刻意不引 bs4 / lxml —— agentd 的依赖表不该为这一个功能多一项，而这种粗提取
-    （去脚本样式 → 块级标签转换行 → 剥标签 → 解实体）用正则够用。
-    代价是表格和复杂排版会走形；在"喂给模型读"的场景里无所谓。
+
+def _doc_description(raw: str) -> str:
+    """从 <head> 里捞 meta description / og:description 的 content。"""
+    m = _META_DESC_NAME_RX.search(raw)
+    if m is None:
+        return ""
+    tag = m.group(0)
+    cm = _META_DESC_CONTENT_RX.search(tag)
+    if cm is None:
+        return ""
+    return _text_of(cm.group(2) or cm.group(3) or cm.group(4) or "")
+
+
+def _head_summary(raw: str) -> str:
+    """把 <title> 和 meta 描述拼成一小段兜底摘要（去重）。
+
+    给 `_html_to_text` 兜底用：正文抽不出来时（JS 渲染页 / 反爬壳），
+    至少让模型看到"这页讲的是什么"，而不是一句"没有正文"。
+    """
+    parts: list[str] = []
+    title = _doc_title(raw)
+    if title:
+        parts.append(title)
+    desc = _doc_description(raw)
+    # 描述常把标题抄一遍，重复就不必再写
+    if desc and desc not in title:
+        parts.append(desc)
+    return " — ".join(parts)
+
+
+def _body_text(raw: str) -> str:
+    """剥掉 head 后把 `<body>` 折成可读纯文本（拿不到 body 就整个当 body）。
+
+    只负责"正文"这一层：去注释/脚本样式 → 块级标签转换行 → 剥标签 → 解实体 →
+    连续空行压一个。head 整块被剔除，`<title>` 因此不会混进正文。
     """
     text = _COMMENT_RX.sub("", raw)
+    # head 整块拿掉：里面只有 title/meta/link/内联样式，留着会把 <title> 文本
+    # 混进正文（head 一般不含 script/style 正文，剥了也不心疼）。
+    text = _HEAD_RX.sub(" ", text)
+    # 拿不到 <body> 的片段（少见）就退化成整篇 —— 总比一个字都不给强。
+    m = _BODY_RX.search(text)
+    if m is not None:
+        text = m.group(1)
     text = _SCRIPT_RX.sub(" ", text)
     text = _BLOCK_RX.sub("\n", text)
     text = _TAG_RX.sub("", text)
@@ -466,6 +526,29 @@ def _html_to_text(raw: str) -> str:
             blanks = 0
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _html_to_text(raw: str, *, fell_back: list[bool] | None = None) -> str:
+    """把 HTML 折成可读纯文本。
+
+    刻意不引 bs4 / lxml —— agentd 的依赖表不该为这一个功能多一项，而这种粗提取
+    （去脚本样式 → 块级标签转换行 → 剥标签 → 解实体）用正则够用。
+    代价是表格和复杂排版会走形；在"喂给模型读"的场景里无所谓。
+
+    正文抽不出来时（正文由 JS 在客户端拼、或页面是反爬壳）退一步，用
+    `<title>` / meta 描述兜底，绝不让一次抓取空手而归 —— 见 `_head_summary`。
+    传 `fell_back`（一个单元素列表）时，兜底与否会写回 `fell_back[0]`，供调用方
+    区分"真正文"和"只有摘要"，无需重跑一遍抽取（见 `_web_fetch`）。
+    """
+    body = _body_text(raw)
+    if body:
+        if fell_back is not None:
+            fell_back[0] = False
+        return body
+    if fell_back is not None:
+        fell_back[0] = True
+    # 正文为空 → 退回 head 摘要（标题 + 描述）；连它也没有就返回空串
+    return _head_summary(raw)
 
 
 class _SearchError(Exception):
@@ -808,6 +891,49 @@ async def _web_search(args: dict, rt: ToolRuntime) -> str:
     return err(f"web_search 失败：Bing（{bing_err}）；{sogou_note}")
 
 
+async def _fetch_once(url: str, *, verify: bool) -> tuple[int, str, str, bytes]:
+    """抓一次 URL，返回 (status, final_url, content_type, body)。
+
+    `verify=False` 时不校验证书 —— 见 `_web_fetch` 里对 CERTIFICATE_VERIFY_FAILED
+    的处理：不少国内资讯站的证书只签了裸域或另一个域（实测 sc.people.com.cn
+    的证书 CN 对不上自己），严格校验会直接连不上，而这些站本身是可读的。
+    """
+    async with httpx.AsyncClient(
+        headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT, verify=verify
+    ) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            status = resp.status_code
+            ctype = resp.headers.get("content-type", "")
+            final_url = str(resp.url)
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= _MAX_HTML_BYTES:  # 到顶就停，别把超大页面读进内存
+                    break
+            return status, final_url, ctype, b"".join(chunks)
+
+
+def _is_tls_error(exc: Exception) -> bool:
+    """这个异常是不是"证书校验没过"这一类。
+
+    httpx 把 SSL 错误包在 ConnectError 里，原始类型在 `__cause__` 上；
+    消息里带 CERTIFICATE_VERIFY_FAILED 是最稳的判据（不同 httpx/ssl 版本
+    的异常层次不完全一样，只认类型容易漏）。
+    """
+    seen = set()
+    node: BaseException | None = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        name = type(node).__name__
+        if "SSLCertVerificationError" in name or "CERTIFICATE_VERIFY_FAILED" in str(node):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
+
+
 async def _web_fetch(args: dict, rt: ToolRuntime) -> str:
     raw = str(args.get("url") or "").strip()
     if not raw:
@@ -817,37 +943,59 @@ async def _web_fetch(args: dict, rt: ToolRuntime) -> str:
 
     limit = min(max(_as_int(args.get("max_bytes"), rt.max_bytes) or rt.max_bytes, 500), _MAX_HTML_BYTES)
 
+    insecure_note = ""
     try:
-        async with httpx.AsyncClient(
-            headers=_WEB_HEADERS, follow_redirects=True, timeout=_WEB_TIMEOUT
-        ) as client:
-            async with client.stream("GET", raw) as resp:
-                resp.raise_for_status()
-                status = resp.status_code
-                ctype = resp.headers.get("content-type", "")
-                final_url = str(resp.url)
-                chunks: list[bytes] = []
-                size = 0
-                async for chunk in resp.aiter_bytes():
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    if size >= _MAX_HTML_BYTES:  # 到顶就停，别把超大页面读进内存
-                        break
-                body = b"".join(chunks)
+        status, final_url, ctype, body = await _fetch_once(raw, verify=True)
     except httpx.HTTPStatusError as exc:
         return err(f"{raw} 返回 HTTP {exc.response.status_code}")
     except httpx.HTTPError as exc:
-        return err(f"抓取 {raw} 失败：{type(exc).__name__}: {exc}")
+        if not _is_tls_error(exc):
+            return err(f"抓取 {raw} 失败：{type(exc).__name__}: {exc}")
+        # 证书对不上（站点自己的证书配错，常见于国内地方站 / 老站）：
+        # 退回不校验再抓一次。只是"读个公开网页"，为它整体失败不值得。
+        try:
+            status, final_url, ctype, body = await _fetch_once(raw, verify=False)
+        except httpx.HTTPStatusError as exc2:
+            return err(f"{raw} 返回 HTTP {exc2.response.status_code}")
+        except httpx.HTTPError as exc2:
+            return err(
+                f"抓取 {raw} 失败（证书校验不过，忽略证书重试也失败）："
+                f"{type(exc2).__name__}: {exc2}"
+            )
+        insecure_note = (
+            f"⚠️ {final_url} 的 TLS 证书校验未通过（证书与域名不匹配），"
+            "已以忽略证书的方式读取，内容来自该站点但不保证未被中间人篡改；"
+            "敏感场景请勿依赖。\n\n"
+        )
 
     if not _looks_textual(ctype):
         return err(
             f"{final_url} 不是文本内容（content-type: {ctype or '未知'}，{len(body)} 字节）"
         )
 
-    text = _html_to_text(_decode(body, ctype))
-    if not text:
-        return err(f"{final_url} 抓回 {len(body)} 字节，但剥掉标签后没有正文")
+    decoded = _decode(body, ctype)
+    fell_back = [False]
+    text = _html_to_text(decoded, fell_back=fell_back)
     head = f"{final_url}（HTTP {status}，{ctype or '未知类型'}，{len(body)} 字节）"
+    head = insecure_note + head
+    if not text:
+        # 整页只有壳（<body> 空的，正文全靠 JS 在浏览器里拼）——标题和 meta 描述
+        # 也一并缺席，确实没东西可给。除了说明原因，还要给**下一步动作**：
+        # 换别的来源 / 用搜索摘要，别对着同一个 URL 反复抓（截图里那三张红色
+        # 失败卡就是模型连抓三次换来的）。
+        return err(
+            f"{final_url} 抓回 {len(body)} 字节，但页面里没有可读正文"
+            "（返回的是空壳：正文由脚本在浏览器里渲染，抓 HTML 拿不到；部分站点还带反爬）"
+            "。抓取 HTTP 页面这条路对本站无效 —— 请改用 web_search 的结果摘要，"
+            "或换一个能直接吐出 HTML 正文的来源，不要重试同一个链接"
+        )
+    if fell_back[0]:
+        # 正文没抽到、只拿到了 title/meta 摘要：当"部分成功"返回，正文照给，
+        # 另起一行明说这是摘要 —— 模型据此知道别拿它当全文，该换源就换源。
+        text = (
+            "（说明：该页面正文由脚本动态渲染，抓取器只取到标题/摘要，"
+            "以下为不完整内容，建议改用其它来源核对）\n\n" + text
+        )
     return _clip(head + "\n\n" + text, limit, what="网页正文")
 
 

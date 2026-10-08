@@ -32,6 +32,7 @@ from agentd.kernel.tools import (
     TOOL_PROFILES,
     _decode,
     _html_to_text,
+    _is_tls_error,
     _looks_textual,
     _parse_bing,
     _unwrap_bing_url,
@@ -1235,6 +1236,81 @@ def test_decode_honors_declared_charset_and_falls_back():
     assert _decode(b"abc", "text/html; charset=no-such-charset") == "abc"
 
 
+def test_html_to_text_falls_back_to_title_when_body_is_js_only():
+    """正文全由 JS 渲染的页面（头条就是）：剥完标签 body 是空的。
+
+    这时 `<title>` 是仅剩的可读信息，必须捞出来 —— 否则 web_fetch 只能空手而归
+    （用户截图里那三张红色失败卡）。
+    """
+    page = (
+        "<html><head><title>成都到北京 3 月新增多条直飞航线</title>"
+        '<meta charset="UTF-8"></head>'
+        "<body></body><script>var glb=1;/* 一大坨混淆 JS */</script></html>"
+    )
+    assert _html_to_text(page) == "成都到北京 3 月新增多条直飞航线"
+
+
+def test_html_to_text_falls_back_to_meta_description():
+    """没有 <title> 时退到 meta description / og:description。"""
+    page = (
+        "<html><head>"
+        '<meta name="description" content="2024 夏秋航季 成都出发新航线加密">'
+        "</head><body></body></html>"
+    )
+    assert _html_to_text(page) == "2024 夏秋航季 成都出发新航线加密"
+
+    # og:description 同样认；content 写在 name 之前的属性顺序也要能解
+    page2 = (
+        "<html><head>"
+        '<meta content="首都机场航班量回升" property="og:description">'
+        "</head><body></body></html>"
+    )
+    assert _html_to_text(page2) == "首都机场航班量回升"
+
+
+def test_html_to_text_uses_head_summary_when_body_is_empty():
+    """同时有 title 和描述时，两者都要出现在兜底结果里（去重拼接）。"""
+    page = (
+        "<html><head><title>东航加密成都-北京</title>"
+        '<meta name="description" content="每日新增两班"></head>'
+        "<body></body></html>"
+    )
+    out = _html_to_text(page)
+    assert "东航加密成都-北京" in out and "每日新增两班" in out
+
+
+def test_html_to_text_prefers_real_body_over_head_summary():
+    """有正文时必须用正文，兜底只在正文为空时才触发。"""
+    page = (
+        "<html><head><title>标题不该出现</title></head>"
+        "<body><p>真正的正文段落</p></body></html>"
+    )
+    out = _html_to_text(page)
+    assert out == "真正的正文段落"
+    assert "标题不该出现" not in out
+
+
+def test_head_summary_reflects_what_web_fetch_fell_back_to():
+    """`fell_back` 出参必须和 `_html_to_text` 的兜底分支判断一致。
+
+    web_fetch 靠它决定要不要给结果加"内容不完整"的说明 —— 判反了就会把
+    正常正文误标成摘要，或者把只有摘要的页面当全文给出去。
+    """
+    empty_body = "<html><head><title>只有标题</title></head><body></body></html>"
+    real_body = "<html><head><title>标题</title></head><body><p>正文</p></body></html>"
+
+    flag = [False]
+    out = _html_to_text(empty_body, fell_back=flag)
+    assert flag[0] is True and out == "只有标题"
+
+    flag = [False]
+    out = _html_to_text(real_body, fell_back=flag)
+    assert flag[0] is False and out == "正文"
+
+    # 不传 out-param 时行为不变（其它调用方无需关心）
+    assert _html_to_text(real_body) == "正文"
+
+
 def test_web_search_requires_query_without_touching_network():
     tb = box(Path.cwd())
     out = asyncio.run(tb.call("web_search", json.dumps({"query": "   "})))
@@ -1291,6 +1367,96 @@ def test_web_fetch_reports_connection_failure(monkeypatch):
     tb = box(Path.cwd())
     out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "http://127.0.0.1:9/x"})))
     assert out.startswith("[错误]") and "抓取" in out
+
+
+def test_is_tls_error_detects_certificate_failure_through_the_wrapper():
+    """证书错的判据：httpx 把它包在 ConnectError 里，原始类型挂在 __cause__ 上。
+
+    只看最外层类型会漏判 —— 那样就不忽略证书重试，用户会看到"抓取失败"红卡，
+    而这本来是个可以绕过的站点配置问题（实测 sc.people.com.cn 就是）。
+    """
+    import ssl
+
+    inner = ssl.SSLCertVerificationError(
+        1, "certificate verify failed: Hostname mismatch, certificate is not "
+           "valid for 'sc.people.com.cn'. (_ssl.c:1032)"
+    )
+    wrapped = __import__("httpx").ConnectError("certificate verify failed")
+    wrapped.__cause__ = inner
+    assert _is_tls_error(wrapped) is True
+    # 普通连接失败不能被当成证书问题（否则会对每一条失败链接都放开校验）
+    plain = __import__("httpx").ConnectError("Connection refused")
+    assert _is_tls_error(plain) is False
+
+
+def test_web_fetch_retries_without_verification_on_cert_mismatch(monkeypatch):
+    """证书不过 → 忽略证书重抓一次，并在结果里明说"证书未校验"。
+
+    这是截图里第二/三类红卡的真实成因：站点证书与域名不匹配，严格校验直接连不上。
+    """
+    import agentd.kernel.tools as tools_mod
+
+    calls: list[bool] = []
+
+    async def fake_fetch_once(url, *, verify):
+        calls.append(verify)
+        if verify:
+            import ssl
+
+            inner = ssl.SSLCertVerificationError(
+                1, "certificate verify failed: Hostname mismatch"
+            )
+            exc = __import__("httpx").ConnectError("certificate verify failed")
+            exc.__cause__ = inner
+            raise exc
+        return 200, url, "text/html; charset=utf-8", "<html><body><p>正文</p></body></html>".encode()
+
+    monkeypatch.setattr(tools_mod, "_fetch_once", fake_fetch_once)
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "https://x.example/a"})))
+
+    assert calls == [True, False], "必须先严格校验、失败后再放开重试"
+    assert not out.startswith("[错误]")
+    assert "证书校验未通过" in out
+    assert "正文" in out
+
+
+def test_web_fetch_does_not_relax_verification_for_ordinary_failures(monkeypatch):
+    """普通连接失败（非证书问题）不许放开校验证书 —— 那是安全边界，不能为了
+    "能抓"就默认降级。"""
+    import agentd.kernel.tools as tools_mod
+
+    calls: list[bool] = []
+
+    async def fake_fetch_once(url, *, verify):
+        calls.append(verify)
+        raise __import__("httpx").ConnectError("Connection refused")
+
+    monkeypatch.setattr(tools_mod, "_fetch_once", fake_fetch_once)
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "https://x.example/a"})))
+
+    assert calls == [True], "只试一次，不重试"
+    assert out.startswith("[错误]") and "抓取" in out
+
+
+def test_web_fetch_marks_js_only_pages_as_unreadable_with_a_next_step(monkeypatch):
+    """整页空壳（头条那种）→ 明确告诉模型"这条路没用，换来源"，别反复抓。
+
+    截图里三张红卡 = 模型对同一类空壳页连抓三次。错误文案必须把"下一步"写进去。
+    """
+    import agentd.kernel.tools as tools_mod
+
+    async def fake_fetch_once(url, *, verify):
+        return 200, url, "text/html", b"<html><head></head><body></body></html>"
+
+    monkeypatch.setattr(tools_mod, "_fetch_once", fake_fetch_once)
+    tb = box(Path.cwd())
+    out = asyncio.run(tb.call("web_fetch", json.dumps({"url": "https://x.example/a"})))
+
+    assert out.startswith("[错误]")
+    assert "没有可读正文" in out
+    assert "web_search" in out and "不要重试同一个链接" in out
 
 
 def test_search_endpoint_is_overridable_by_env(monkeypatch):
