@@ -238,6 +238,15 @@ provider 在**下一轮对话**即生效，不用重启进程。
 agent 模式下的工具来自两条路，对模型完全透明（合并成一个 `tools` 数组，
 靠名字路由回各自的执行器）：
 
+**大结果外置化（`kernel/blobstore.py`，设计参考 WorkBuddy 的 ToolResultBlobService）：**
+任何工具的输出超过 **50KB**（字节口径，`AGENTD_TOOL_RESULT_THRESHOLD_KB` 可调）时，
+全文落到 `~/.agentd/tool_results/<会话>/<call_id>.txt`，模型和工具卡片只拿到
+**2048 字符预览 + 文件路径**（`<persisted-output>` 包装）。要全文就用
+`read_file` 读那个路径。这是 2026-10-08 事故的治本项：一篇几百 KB 的网页正文
+曾被打成一行 JSON-RPC 大帧，把 GUI 侧 stdout 读入上限打爆、误报
+「agent 进程已退出」——管道里的帧本来就不该有这么大。中文 1 字符 = 3 字节，
+所以阈值按**字节**判定而不是字符数。
+
 ### 1. 原生工具（进程内，默认开启）
 
 | 工具 | kind | 要不要审批 | 干什么 |

@@ -27,6 +27,7 @@ from collections.abc import AsyncIterator
 from typing import ClassVar
 
 from ...contracts import Event, MessageDelta, MessageDone, Notice, ThoughtDelta, ToolCallDone, ToolCallStart
+from ..blobstore import externalize
 from ..llm import LLMNotice, LLMText, LLMThought, LLMToolCall
 from ..mcp import McpHub, ToolBinding
 from ..models import Message, ToolCall
@@ -246,11 +247,20 @@ class AgentMode(Mode):
                 return
 
         output = await self._execute(ctx, hub, call, native, mcp)
+        failed = output.startswith(ERROR_PREFIX)
+        # 大结果外置化（参考 WorkBuddy ToolResultBlobService）：超过阈值的
+        # 工具输出全文落盘，模型与界面只拿「预览 + 文件路径」。这是
+        # 2026-10-08「大帧打死 GUI 读帧任务」事故的治本项 —— GUI 侧放大
+        # limit 只是止血，管道里的帧本就不该有几百 KB。
+        # 失败输出不外置：错误信息必须完整可见，而且不能让外置包装把
+        # failed 状态挤掉。
+        if not failed:
+            output = externalize(output, ctx.session_id, call.id)
         yield ToolCallDone(
             session_id=ctx.session_id,
             run_id=ctx.run_id,
             call_id=call.id,
-            status="failed" if output.startswith(ERROR_PREFIX) else "completed",
+            status="failed" if failed else "completed",
             output=output,
         )
         yield Message.tool(output, tool_call_id=call.id, name=call.name)
