@@ -124,22 +124,27 @@ async def test_agent_mode_no_tools_behaves_like_single(monkeypatch):
 
 
 class _AlwaysCallsLLM:
-    """每一步都只要调工具 —— 用来把 MAX_STEPS 耗光。"""
+    """每一步都只要调工具 —— 用来把 MAX_STEPS 耗光。记录每次调用供断言。"""
 
     def __init__(self, preamble: str) -> None:
         self.preamble = preamble
-        self.calls = 0
+        self.calls: list[dict] = []
 
     async def stream_events(self, messages, *, system=None, tools=None):
-        self.calls += 1
+        self.calls.append({"messages": list(messages), "tools": tools})
         yield LLMText(self.preamble)
-        yield LLMToolCall(id=f"c{self.calls}", name="echo__echo", arguments="{}")
+        yield LLMToolCall(id=f"c{len(self.calls)}", name="echo__echo", arguments="{}")
 
 
 async def test_agent_mode_hitting_step_limit_does_not_answer_with_preamble(monkeypatch):
-    """耗尽循环时不能把"让我再试一个来源"当过场话交给用户。"""
+    """耗尽循环时不能把"让我再试一个来源"当过场话交给用户。
+
+    2026-10-09 起收尾逻辑改为两级护栏：软警告（剩 2 步时注入收敛指令）+
+    硬护栏（步数耗尽后追加一轮 tools=None 的收尾调用）。收尾调用若还在说
+    过场话，仍退回 _LOOP_LIMIT_NOTE。
+    """
     import agentd.kernel.modes.agent as agent_mod
-    from agentd.kernel.modes.agent import MAX_STEPS
+    from agentd.kernel.modes.agent import MAX_STEPS, _WRAPUP_ASK
 
     monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
 
@@ -147,7 +152,13 @@ async def test_agent_mode_hitting_step_limit_does_not_answer_with_preamble(monke
     ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
     events = [e async for e in AgentMode().run(ctx, "hi")]
 
-    assert llm.calls == MAX_STEPS, "应当正好烧满上限"
+    assert len(llm.calls) == MAX_STEPS + 1, "循环烧满上限 + 1 次收尾调用"
+    # 收尾调用不带工具 —— 模型到了这步只能给答复，不能再拖
+    assert llm.calls[-1]["tools"] is None
+    # 收尾调用收到了硬护栏指令
+    assert any(
+        m.role == "user" and m.content == _WRAPUP_ASK for m in llm.calls[-1]["messages"]
+    )
     done = events[-1]
     assert isinstance(done, MessageDone)
     # 关键断言：不能是那句过场话
@@ -156,6 +167,67 @@ async def test_agent_mode_hitting_step_limit_does_not_answer_with_preamble(monke
     # 要说清发生了什么、并给出下一步
     assert str(MAX_STEPS) in done.text
     assert "继续" in done.text
+
+
+async def test_agent_mode_budget_warning_injected_two_steps_before_limit(monkeypatch):
+    """软护栏：剩 2 步时上下文里出现收敛指令，且只进上下文（不 yield 落库）。"""
+    import agentd.kernel.modes.agent as agent_mod
+    from agentd.kernel.modes.agent import MAX_STEPS, _WARN_REMAINING, _BUDGET_WARN
+
+    monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
+
+    llm = _AlwaysCallsLLM("让我换个来源：")
+    ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
+    events = [e async for e in AgentMode().run(ctx, "hi")]
+
+    # 警告只注入一次：此后每次调用（含收尾调用）的上下文里都有它。
+    # 首次出现 = 耗尽前第 _WARN_REMAINING 次调用（0 基下标 MAX_STEPS-_WARN_REMAINING）。
+    with_warn = [i for i, c in enumerate(llm.calls)
+                 if any(m.role == "user" and m.content == _BUDGET_WARN
+                        for m in c["messages"])]
+    assert with_warn == list(range(MAX_STEPS - _WARN_REMAINING, MAX_STEPS + 1)), (
+        f"警告应从剩余 {_WARN_REMAINING} 步的那次调用起持续到收尾，实际：{with_warn}"
+    )
+    # 事件流里没有警告文本 —— 它不该被渲染给用户
+    assert not any(
+        getattr(e, "text", "") == _BUDGET_WARN for e in events
+    )
+
+
+async def test_agent_mode_wrapup_call_delivers_final_answer(monkeypatch):
+    """硬护栏的价值：步数烧完后，收尾调用的答复就是本轮最终结论。"""
+    import agentd.kernel.modes.agent as agent_mod
+    from agentd.kernel.modes.agent import MAX_STEPS
+
+    monkeypatch.setattr(agent_mod, "McpHub", _FakeHub)
+
+    class _CallsThenWraps:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def stream_events(self, messages, *, system=None, tools=None):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            # 收尾调用的标志是上下文里有硬护栏指令（本测试没有工具 schema，
+            # 循环调用也是 tools=None，不能拿 tools 区分）
+            from agentd.kernel.modes.agent import _WRAPUP_ASK
+
+            if any(m.role == "user" and m.content == _WRAPUP_ASK for m in messages):
+                # 收尾调用：模型基于已有信息给出真正结论
+                yield LLMText("基于已抓取的数据，成都飞北京最低 2100 元，详见下表。")
+                return
+            yield LLMText("让我再抓一个来源：")
+            yield LLMToolCall(id=f"c{len(self.calls)}", name="echo__echo", arguments="{}")
+
+    llm = _CallsThenWraps()
+    ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
+    events = [e async for e in AgentMode().run(ctx, "hi")]
+
+    assert len(llm.calls) == MAX_STEPS + 1
+    assert llm.calls[-1]["tools"] is None
+    done = events[-1]
+    assert isinstance(done, MessageDone)
+    assert done.text == "基于已抓取的数据，成都飞北京最低 2100 元，详见下表。"
+    assert "上限" not in done.text and "继续」" not in done.text
 
 
 async def test_agent_mode_keeps_real_conclusion_at_step_limit(monkeypatch):
@@ -169,7 +241,7 @@ async def test_agent_mode_keeps_real_conclusion_at_step_limit(monkeypatch):
     ctx = ModeContext(session_id="s", run_id="r", llm=llm, history=[Message.user("hi")])
     events = [e async for e in AgentMode().run(ctx, "hi")]
 
-    assert llm.calls == MAX_STEPS
+    assert len(llm.calls) == MAX_STEPS + 1
     assert events[-1].text == "已为你整理好 3 个航班，详见上表。"
 
 

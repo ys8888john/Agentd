@@ -36,12 +36,37 @@ from ..tools import ERROR_PREFIX, ApprovalRequest, NativeTool, needs_approval
 from .base import Mode, ModeContext
 
 # 工具循环上限：防模型来回调不停（每次循环至少一次 LLM 调用）。
-MAX_STEPS = 12
+# 12 步对"多来源搜索 + 整理成文件"这类任务偏紧（2026-10-09 实测航班任务
+# 12 步烧完还在 read_file），提到 16；真跑不完还有下面两级护栏兜住。
+MAX_STEPS = 16
+
+# 软护栏：剩这么多步时往本轮上下文注入一条收敛指令（只进 messages、不 yield
+# —— 不落库、界面看不到）。让模型在烧完之前自己规划"最后两步出交付物"。
+_WARN_REMAINING = 2
+_BUDGET_WARN = (
+    "（系统提示，用户在界面上看不到这条）本轮剩余的工具调用步数只剩 2 步了。"
+    "请立即停止扩大搜索/抓取面，开始收敛：马上用已经拿到的信息完成用户的任务"
+    " —— 需要产出文件就现在调用 make_xlsx / write_file；信息不够就基于现有"
+    "信息给出最好的结果，并明确说明还缺什么。不要把剩余步数花在继续收集上。"
+)
+
+# 硬护栏：步数耗尽后追加一轮**不带工具**的收尾调用。到这一步模型已经没有
+# 工具可调，唯一正确的动作是基于已收集的信息给出最终答复 —— 无论任务完成
+# 与否，用户一定能拿到一段有内容的结论，而不是"回复继续"。这层是
+# 「突然停止没有输出」的 100% 兜底（2026-10-09 用户要求）。
+_WRAPUP_ASK = (
+    "（系统提示）工具调用步数已用完，本轮不允许再调用任何工具。请基于以上"
+    "已获取的信息立即给出最终答复：能完成的部分直接给出结果（例如把整理好的"
+    "数据写成表格/清单放进正文），没完成的部分如实说明缺了什么、给出已确认的"
+    "部分。不要提「回复继续」，不要说「让我再试试」。"
+)
 
 # 到上限时给用户兜底的正文。**不能用最后一步的文本** —— 那通常是模型准备调下一个
 # 工具的过场话（"让我尝试从另一个来源获取…"），拿它当答复就是"没给答案就中断"
 # （2026-10-08 实测 sess_65a0584cc8f94dd6：12 轮全烧在反复 web_search/web_fetch 上，
 # 最后一条停在"让我尝试从另一个来源获取更详细的航班信息"，用户看到的就是这个）。
+# 注意：这只是收尾调用本身也失败/返回空时的最后兜底 —— 正常情况下硬护栏那轮
+# 会给出真正的答复。
 _LOOP_LIMIT_NOTE = (
     "（已达到本轮工具调用上限 {n} 步，未能收敛出完整结论。）\n\n"
     "上面已完成的搜索/抓取结果仍然有效，可以据此参考。若要继续，请直接回复"
@@ -128,7 +153,7 @@ class AgentMode(Mode):
             final_text = ""  # 收尾时定格的正文（正常走完=最后一步文本；被叫停=已流出的部分）
             stopped = False  # 本轮是被人叫停的，还是撞到步数上限的 —— 收尾话术不同
 
-            for _ in range(MAX_STEPS):
+            for step in range(MAX_STEPS):
                 if ctx.cancelled():
                     final_text = "（已手动停止）"
                     stopped = True
@@ -209,14 +234,56 @@ class AgentMode(Mode):
                     stopped = True
                     break
 
-            # 到上限还没收敛：把已有文本收尾，别把用户晾着。
-            # 注意用 _fallback_text：last_text 常常只是"让我换个来源"的过场话，
-            # 直接当答复就是"没给答案就突然中断"。
-            # 被叫停时不套这段话术 —— 那不是"到上限"，用户自己按的停。
+                # 软护栏：步数快烧完时注入收敛指令 —— 只 append 进本轮上下文，
+                # 不 yield（不落库、界面看不到）。下一次 LLM 调用就会看到它，
+                # 从而把最后两步花在"出交付物"而不是继续收集。
+                remaining = MAX_STEPS - (step + 1)
+                if remaining == _WARN_REMAINING and not ctx.cancelled():
+                    messages.append(Message(role="user", content=_BUDGET_WARN))
+
+            # 到上限还没收敛：**硬护栏** —— 追加一轮不带工具的收尾调用，
+            # 强制模型基于已收集的信息给出最终答复。这是「突然停止没有输出」
+            # 的兜底：无论任务完成与否，用户都能拿到一段有内容的结论。
+            # 被叫停时不做收尾调用 —— 那不是"到上限"，用户自己按的停。
             if stopped:
                 closing = final_text or last_text
             else:
-                closing = _fallback_text(final_text or last_text)
+                wrap_text = ""
+                try:
+                    messages.append(Message(role="user", content=_WRAPUP_ASK))
+                    stream = ctx.llm.stream_events(messages, system=ctx.system, tools=None)
+                    try:
+                        async for event in stream:
+                            if isinstance(event, LLMText):
+                                wrap_text += event.text
+                                yield MessageDelta(
+                                    session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                                )
+                            elif isinstance(event, LLMThought):
+                                yield ThoughtDelta(
+                                    session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                                )
+                            elif isinstance(event, LLMNotice):
+                                yield Notice(
+                                    session_id=ctx.session_id, run_id=ctx.run_id, text=event.text
+                                )
+                            if ctx.cancelled():
+                                break
+                    finally:
+                        await stream.aclose()
+                except Exception:  # noqa: BLE001 - 收尾调用失败也不能把用户晾着
+                    wrap_text = ""
+
+                wrap_text = wrap_text.strip()
+                if ctx.cancelled() and not wrap_text:
+                    closing = final_text or last_text or "（已手动停止）"
+                elif wrap_text and not _looks_like_preamble(wrap_text):
+                    # 收尾调用给出了真正的答复 —— 它就是本轮的最终结论
+                    closing = wrap_text
+                else:
+                    # 收尾调用也哑了（空文本 / 还在说"让我再试试"）：
+                    # 退回兜底话术，至少把状况讲清楚
+                    closing = _fallback_text(final_text or last_text)
             yield MessageDone(
                 session_id=ctx.session_id,
                 run_id=ctx.run_id,
