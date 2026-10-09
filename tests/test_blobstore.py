@@ -60,6 +60,19 @@ def test_exactly_at_threshold_not_persisted(tmp_path):
     assert externalize(text, "s", "c", home=tmp_path) == text
 
 
+def test_wrapper_reports_line_count_and_reading_strategy(tmp_path, monkeypatch):
+    """包装必须给模型足够的决策信息：全文行数 + 怎么读省回合。
+
+    2026-10-09 航班案例：7759 行转储外置后，模型只看到 2048 字符预览（全是
+    页面导航），不知道文件多大、单次能拿多少，于是 50-100 行地翻页直到没下文。
+    """
+    monkeypatch.setattr(blobstore, "THRESHOLD_BYTES", 1000)
+    big = "\n".join(f"row{i}" for i in range(3000))
+    wrapped = externalize(big, "s", "c", home=tmp_path)
+    assert "共 3000 行" in wrapped
+    assert "grep" in wrapped and "read_file" in wrapped
+
+
 # ---- 接进 AgentMode ----
 
 

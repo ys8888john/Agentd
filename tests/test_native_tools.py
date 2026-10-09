@@ -185,6 +185,44 @@ async def test_read_file_errors_are_prefixed(tmp_path):
     assert (await tb.call("read_file", "{}")).startswith("[错误]")
 
 
+async def test_read_file_header_reports_size_and_cap(tmp_path):
+    """头部必须报文件规模与单次上限，模型才能规划几次读完（航班案例教训）。"""
+    (tmp_path / "a.txt").write_text("x" * 3000, encoding="utf-8")
+    tb = box(tmp_path)
+    out = await tb.call("read_file", json.dumps({"path": "a.txt"}))
+    assert "共 1 行 / 约2KB" in out
+    assert "单次输出上限约 64KB" in out
+
+
+async def test_read_file_discourages_thin_paging(tmp_path):
+    """小步分片翻大文件 → 劝阻并指路（grep 定位 / 整读）；读到文件尾不再劝。"""
+    lines = "\n".join(f"line{i}" for i in range(800))
+    (tmp_path / "dump.txt").write_text(lines, encoding="utf-8")
+    tb = box(tmp_path)
+
+    out = await tb.call("read_file", json.dumps({"path": "dump.txt", "offset": 1, "limit": 100}))
+    assert "[提示]" in out
+    assert "grep" in out and "整读" in out
+
+    # 最后一段：后面没有内容了，劝阻没有意义
+    out = await tb.call("read_file", json.dumps({"path": "dump.txt", "offset": 701, "limit": 100}))
+    assert "[提示]" not in out
+
+
+async def test_read_file_no_paging_hint_on_small_files_or_full_reads(tmp_path):
+    """小文件翻页不管；整读（不传 limit）也不管——只治"大文件 + 小步"组合。"""
+    (tmp_path / "small.txt").write_text("\n".join(f"l{i}" for i in range(50)), encoding="utf-8")
+    (tmp_path / "dump.txt").write_text("\n".join("x" for _ in range(800)), encoding="utf-8")
+    tb = box(tmp_path)
+
+    out = await tb.call("read_file", json.dumps({"path": "small.txt", "limit": 20}))
+    assert "[提示]" not in out
+
+    out = await tb.call("read_file", json.dumps({"path": "dump.txt"}))
+    assert "[提示]" not in out
+    assert "     1\tx" in out  # 确认整读拿到的确实是 dump.txt 的内容
+
+
 async def test_glob_lists_relative_paths_newest_first(tmp_path):
     (tmp_path / "src").mkdir()
     old = tmp_path / "src" / "old.py"

@@ -1004,6 +1004,30 @@ async def _web_fetch(args: dict, rt: ToolRuntime) -> str:
 # ---------------------------------------------------------------------------
 
 
+_PAGING_HINT_THRESHOLD_LINES = 400  # 文件超过这么多行才算"大文件"
+_PAGING_HINT_MIN_CHUNK = 200        # 单次只取少于这么多行才算"小步分片"
+
+
+def _paging_hint(total: int, start: int, taken: int, max_bytes: int) -> str:
+    """模型用小步分片翻大文件时的劝阻提示（没读到文件尾才提示）。
+
+    2026-10-09 航班时刻表案例：web_fetch 的 7759 行转储被模型每次读 50-100 行，
+    翻了 7 次（~600 行）还没碰到正文就没了下文。单次 64KB 的预算没变，坏在
+    没有任何一层告诉模型"一次能拿多少、大文件该怎么读"——这里把话说明白。
+    """
+    if taken >= _PAGING_HINT_MIN_CHUNK or total <= _PAGING_HINT_THRESHOLD_LINES:
+        return ""
+    if start + taken >= total:
+        return ""
+    cap_kb = max(max_bytes // 1024, 1)
+    return (
+        f"\n[提示] 你正以每次 {taken} 行的粒度翻一份共 {total} 行的大文件，"
+        "这样读完要几十次调用。更省回合的做法：要找特定内容 → 先用 grep"
+        "（结果自带行号），再按行号 offset 精读目标段；要通读 → 不传 limit "
+        f"整读（单次最多取回约 {cap_kb}KB，装不下的部分用 offset 续读）。"
+    )
+
+
 async def _read_file(args: dict, rt: ToolRuntime) -> str:
     raw = str(args.get("path") or "").strip()
     if not raw:
@@ -1027,8 +1051,15 @@ async def _read_file(args: dict, rt: ToolRuntime) -> str:
     if not chosen:
         return err(f"{raw} 在 offset 之后没有内容（该文件共 {len(lines)} 行）")
     body = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(chosen))
-    header = f"{raw}（共 {len(lines)} 行，本次显示第 {start + 1}-{start + len(chosen)} 行）\n"
-    return _clip(header + body, rt.max_bytes, what="文件内容")
+    # 头部给出文件规模与单次上限：模型要能自己规划"几次读完"，而不是摸黑翻页
+    size_kb = max(len(text.encode("utf-8")) // 1024, 1)
+    cap_kb = max(rt.max_bytes // 1024, 1)
+    header = (
+        f"{raw}（共 {len(lines)} 行 / 约{size_kb}KB，"
+        f"本次第 {start + 1}-{start + len(chosen)} 行，单次输出上限约 {cap_kb}KB）\n"
+    )
+    out = header + body + _paging_hint(len(lines), start, len(chosen), rt.max_bytes)
+    return _clip(out, rt.max_bytes, what="文件内容")
 
 
 async def _glob(args: dict, rt: ToolRuntime) -> str:
@@ -1606,7 +1637,8 @@ _SPECS: tuple[NativeTool, ...] = (
         name="read_file",
         description=(
             "读取一个文本文件，返回带行号的内容（行号 1-based）。"
-            "大文件用 offset/limit 分段读。"
+            "几百行以内的文件直接整读（不传 limit 一次拿全）；大文件先用 grep "
+            "定位行号，再用 offset/limit 精读目标段，不要几十行地小步翻页。"
         ),
         parameters={
             "type": "object",

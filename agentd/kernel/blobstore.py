@@ -72,11 +72,14 @@ def externalize(output: str, session_id: str, call_id: str, *, home: Path | None
     preview = output[:PREVIEW_CHARS]
     more = "\n..." if len(output) > PREVIEW_CHARS else ""
     kb = f"{size_bytes / 1024:.1f}KB"
+    n_lines = output.count("\n") + 1
     return "\n".join(
         [
             "<persisted-output>",
-            f"输出过大（{kb}），完整内容已保存到：{path}",
-            f"要全文就用 read_file 读上面的路径。",
+            f"输出过大（{kb}，共 {n_lines} 行），完整内容已保存到：{path}",
+            "读取建议：要找特定内容 → 对上面的文件用 grep（结果自带行号）；"
+            "要通读 → 用 read_file 不传 limit 整读（单次默认最多取回 64KB），"
+            "装不下的部分用 offset 续读。",
             "",
             f"预览（前 {PREVIEW_CHARS} 字符）：",
             preview + more,
