@@ -13,12 +13,16 @@ system prompt 里只放「名称 + 一句话描述」的索引（见 :func:`inde
 模型判断某个技能跟当前任务相关，再用 ``load_skill`` 工具取完整正文。
 一个 50 技能的库，常驻上下文只有索引那一点。
 
-三层来源（后者覆盖前者，同名技能以更靠近用户的为准）
+四层来源（后者覆盖前者，同名技能以更靠近用户的为准）
 ----------------------------------------------------
-1. builtin：随包捆绑（``agentd/kernel/skills/<name>/``）—— 精选过的开源技能，
-   许可见各目录内文件与 skills/README.md；
-2. user：``~/.agentd/skills/`` —— 用户自己装的；
-3. project：``<cwd>/.agentd/skills/`` —— 项目级，跟着仓库走。
+1. builtin：随包捆绑（``agentd/kernel/skills/<name>/``）—— 自己手写的技能；
+2. upstream：**git submodule** 引入的上游技能库（``vendor/``，见
+   ``skills_sources.json`` 清单）—— 只暴露清单里点名（allow）的技能：
+   上游库不是所有内容都适合我们（superpowers 有 Claude Code 专属技能、
+   anthropic 仓有 source-available 的文档技能），清单就是过滤闸门；
+   submodule 未初始化（普通 clone）时整层静默缺席，不报错；
+3. user：``~/.agentd/skills/`` —— 用户自己装的；
+4. project：``<cwd>/.agentd/skills/`` —— 项目级，跟着仓库走。
 
 实现刻意不引 pyyaml：frontmatter 实际只用得上 ``key: value`` 和
 ``key: |``（块标量）两种形态，几十行解析器换零依赖，划算。
@@ -26,6 +30,7 @@ system prompt 里只放「名称 + 一句话描述」的索引（见 :func:`inde
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -36,6 +41,14 @@ from pathlib import Path
 _DESC_MAX = 160
 # 索引整体预算（字符）：技能再多也不能把 system prompt 吃穿。
 _INDEX_BUDGET_CHARS = 2400
+# 单个技能正文的加载上限（load_body 的二次保险；超出给 read_file 路径续读）
+_BODY_MAX_CHARS = 10_000
+
+# submodule 清单与仓库根（agentd/kernel/skills.py → parents[2] = 仓库根）
+_MANIFEST_PATH = Path(__file__).resolve().parent / "skills_sources.json"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# 包内 builtin 技能目录
+_BUILTIN_ROOT = Path(__file__).resolve().parent / "skills"
 
 
 @dataclass(frozen=True)
@@ -45,7 +58,7 @@ class Skill:
     name: str
     description: str
     path: Path
-    source: str  # builtin / user / project
+    source: str  # builtin / upstream / user / project
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -94,45 +107,72 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return fields, body
 
 
-def _skill_dirs(cwd: str | Path | None) -> list[tuple[Path, str]]:
-    """三层来源，按优先级从低到高排列。不存在/建不了的目录跳过。"""
-    dirs: list[tuple[Path, str]] = [
-        (Path(__file__).resolve().parent / "skills", "builtin"),
-        (Path.home() / ".agentd" / "skills", "user"),
+def _scan(root: Path, source: str) -> list[tuple[Path, str]]:
+    """扫一个技能库根目录，返回 (技能目录, 来源)。坏目录返回空。"""
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [
+        (root / entry, source)
+        for entry in entries
+        if (root / entry / "SKILL.md").is_file()
     ]
+
+
+def _upstream() -> list[tuple[Path, str]]:
+    """submodule 层：清单（skills_sources.json）里点名的技能目录。
+
+    只暴露 allow 名单内的技能 —— 上游库整仓扫描会把 Claude Code 专属技能
+    和 source-available 文档技能也带进来。submodule 未初始化时目录不存在，
+    整层返回空（普通 clone 也能跑，只是没有上游技能）。
+    """
+    try:
+        manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[tuple[Path, str]] = []
+    for src in manifest.get("sources", []):
+        try:
+            subdir = (_REPO_ROOT / str(src["repo"]) / str(src.get("subdir", ""))).resolve()
+            allow = [str(n) for n in src.get("allow", [])]
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+        for name in sorted(allow):
+            skill_dir = subdir / name
+            if (skill_dir / "SKILL.md").is_file():
+                out.append((skill_dir, "upstream"))
+    return out
+
+
+def _candidate_dirs(cwd: str | Path | None) -> list[tuple[Path, str]]:
+    """全部候选技能目录，优先级从低到高：builtin < upstream < user < project。"""
+    out = _scan(_BUILTIN_ROOT, "builtin")
+    out.extend(_upstream())
+    out.extend(_scan(Path.home() / ".agentd" / "skills", "user"))
     if cwd:
         try:
-            dirs.append((Path(cwd).expanduser().resolve() / ".agentd" / "skills", "project"))
+            out.extend(_scan(Path(cwd).expanduser().resolve() / ".agentd" / "skills", "project"))
         except OSError:  # pragma: no cover - cwd 怪异时只丢项目层
             pass
-    return dirs
+    return out
 
 
 def discover(cwd: str | Path | None = None) -> dict[str, Skill]:
     """扫全部来源，返回 {name: Skill}。坏技能静默跳过（发现器不能挂）。"""
     found: dict[str, Skill] = {}
-    for root, source in _skill_dirs(cwd):
+    for skill_dir, source in _candidate_dirs(cwd):
         try:
-            entries = sorted(os.listdir(root))
+            fields, _ = parse_frontmatter(
+                (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+            )
+            name = str(fields.get("name") or "").strip()
+            description = str(fields.get("description") or "").strip()
         except OSError:
             continue
-        for entry in entries:
-            skill_md = root / entry / "SKILL.md"
-            try:
-                if not skill_md.is_file():
-                    continue
-                fields, _ = parse_frontmatter(
-                    skill_md.read_text(encoding="utf-8", errors="replace")
-                )
-                name = str(fields.get("name") or "").strip()
-                description = str(fields.get("description") or "").strip()
-            except OSError:
-                continue
-            if not name:
-                continue
-            found[name] = Skill(
-                name=name, description=description, path=root / entry, source=source
-            )
+        if not name:
+            continue
+        found[name] = Skill(name=name, description=description, path=skill_dir, source=source)
     return found
 
 
@@ -162,7 +202,7 @@ def index_section(cwd: str | Path | None = None) -> str:
         lines.append(line)
         used += len(line)
     if truncated:
-        lines.append(f"…（其余技能未列入索引，可用 load_skill 按名加载；已知名称见技能目录）")
+        lines.append("…（其余技能未列入索引，可用 load_skill 按名加载）")
     return "\n".join(lines)
 
 
@@ -170,7 +210,7 @@ def load_body(name: str, cwd: str | Path | None = None) -> str:
     """取一个技能的完整 SKILL.md 正文（load_skill 工具的落点）。
 
     找不到时返回带候选名单的错误文本 —— 模型看到名单能自我纠正，不用再来回猜。
-    正文过大时截断（与工具输出上限同一量级的二次保险）。
+    正文过大时截断（模型可用 read_file 按给出的路径续读）。
     """
     skills = discover(cwd)
     skill = skills.get(name)
@@ -181,8 +221,10 @@ def load_body(name: str, cwd: str | Path | None = None) -> str:
         text = (skill.path / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return f"错误：技能 {name} 的 SKILL.md 读不出来：{exc}"
-    # 护栏：个别技能正文带大附录，直接灌会挤占上下文。10KB 足够任何工作流正文。
-    if len(text) > 10_000:
-        text = text[:10_000] + "\n…（正文过长已截断；完整文件：" + str(skill.path / "SKILL.md") + "）"
+    if len(text) > _BODY_MAX_CHARS:
+        text = (
+            text[:_BODY_MAX_CHARS]
+            + f"\n…（正文过长已截断；用 read_file 读完整文件：{skill.path / 'SKILL.md'}）"
+        )
     extra = f"（技能目录：{skill.path}；如含 scripts/ 子目录，可用 run_command 执行其中的脚本）"
     return f"{text}\n\n{extra}"

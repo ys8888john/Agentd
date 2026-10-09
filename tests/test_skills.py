@@ -1,27 +1,57 @@
 """Agent Skills（SKILL.md 标准）发现与加载的测试。
 
-三层来源（builtin < user < project，同名覆盖）+ 索引 + load_body。
-user 层依赖 Path.home()，测试里不碰它：用 builtin（真实捆绑技能）与
-project（tmp_path）两层就能覆盖发现、覆盖、索引、加载四条链路。
+四层来源（builtin < upstream(submodule) < user < project，同名覆盖）。
+user 层依赖 Path.home()，测试里不碰它：用 upstream（submodule 白名单）、
+builtin（包内目录）与 project（tmp_path）覆盖发现、覆盖、索引、加载四条链路。
+
+upstream 层依赖 submodule 已初始化 —— 普通 clone 没有 vendor/ 内容，
+相关用例会跳过（这是设计行为：缺 submodule 不报错，只是没有上游技能）。
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from agentd.kernel import skills
-from agentd.kernel.skills import Skill, discover, index_section, load_body, parse_frontmatter
+from agentd.kernel.skills import (
+    Skill,
+    _MANIFEST_PATH,
+    _REPO_ROOT,
+    discover,
+    index_section,
+    load_body,
+    parse_frontmatter,
+)
 
-# 捆绑技能清单 —— 这份名单本身就是契约：删技能/改 名 要有意识地更新这里
-BUILTIN = {
+# upstream 白名单里点名的技能 —— 这份名单本身就是契约：
+# 改 manifest / 删 submodule 要有意识地更新这里
+UPSTREAM = {
     "systematic-debugging",
     "verification-before-completion",
     "test-driven-development",
     "writing-plans",
     "skill-creator",
 }
+
+# source-available（专有）技能：引用可以、暴露/捆绑不行
+_SOURCE_AVAILABLE = {"docx", "pdf", "pptx", "xlsx"}
+
+
+def _submodules_ready() -> bool:
+    """submodule 是否已初始化（vendor/ 下有上游 skills/ 目录）。"""
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    for src in manifest.get("sources", []):
+        if not (_REPO_ROOT / src["repo"] / src.get("subdir", "")).is_dir():
+            return False
+    return True
+
+
+needs_submodules = pytest.mark.skipif(
+    not _submodules_ready(), reason="submodule 未初始化：git submodule update --init"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -61,16 +91,18 @@ def test_parse_frontmatter_quoted_value():
 # ---------------------------------------------------------------------------
 
 
-def test_builtin_skills_are_discovered():
-    """捆绑技能是包的一部分，发现器必须能找到 —— 少一个就是打包配置坏了。"""
+def test_upstream_skills_discovered_from_submodule():
+    """submodule 初始化后，白名单里的技能必须以 upstream 层被发现。"""
+    if not _submodules_ready():
+        pytest.skip("submodule 未初始化：git submodule update --init")
     found = discover()
-    missing = BUILTIN - set(found)
-    assert not missing, f"捆绑技能没被发现：{missing}（检查 agentd/kernel/skills/ 是否随包发布）"
-    assert all(found[name].source == "builtin" for name in BUILTIN)
+    missing = UPSTREAM - set(found)
+    assert not missing, f"白名单里的技能没被发现：{missing}（检查 vendor/ 与 manifest）"
+    assert all(found[name].source == "upstream" for name in UPSTREAM)
 
 
-def test_project_layer_overrides_builtin(tmp_path: Path):
-    """同名技能：项目层覆盖内置层 —— 用户改工作流不必动包。"""
+def test_project_layer_overrides_upstream(tmp_path: Path):
+    """同名技能：项目层覆盖 upstream —— 用户改工作流不必动 submodule。"""
     proj = tmp_path / ".agentd" / "skills" / "writing-plans"
     proj.mkdir(parents=True)
     (proj / "SKILL.md").write_text(
@@ -82,6 +114,13 @@ def test_project_layer_overrides_builtin(tmp_path: Path):
     assert found["writing-plans"].description == "项目定制版计划写法"
 
 
+def test_manifest_missing_or_broken_disables_upstream_only(tmp_path: Path, monkeypatch):
+    """清单缺失/损坏只关掉 upstream 层，不能让发现器崩。"""
+    monkeypatch.setattr(skills, "_MANIFEST_PATH", tmp_path / "nope.json")
+    found = discover()
+    assert not any(s.source == "upstream" for s in found.values())
+
+
 def test_broken_skill_is_skipped_silently(tmp_path: Path):
     """坏掉的技能（没有 name / 没有 SKILL.md）不能让发现器崩，跳过即可。"""
     bad = tmp_path / ".agentd" / "skills" / "broken"
@@ -90,7 +129,8 @@ def test_broken_skill_is_skipped_silently(tmp_path: Path):
     (tmp_path / ".agentd" / "skills" / "empty").mkdir(parents=True)
     found = discover(tmp_path)
     assert "broken" not in found and "empty" not in found
-    assert BUILTIN <= set(found)  # 其余照常
+    if _submodules_ready():
+        assert UPSTREAM <= set(found)  # 其余照常
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +138,11 @@ def test_broken_skill_is_skipped_silently(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
+@needs_submodules
 def test_index_contains_names_and_description_snippet():
     idx = index_section()
     assert "load_skill" in idx
-    for name in BUILTIN:
+    for name in UPSTREAM:
         assert name in idx
 
 
@@ -119,19 +160,22 @@ def test_index_respects_description_truncation(tmp_path: Path):
     assert len(line) < 400
 
 
+@needs_submodules
 def test_load_body_returns_full_skill():
     body = load_body("systematic-debugging")
-    assert "# Systematic Debugging" in body or "Systematic" in body
+    assert "Systematic" in body
     assert "技能目录" in body  # 附带目录信息（scripts 提示）
 
 
+@needs_submodules
 def test_load_body_missing_lists_candidates():
     out = load_body("不存在的技能")
     assert "错误" in out
-    for name in BUILTIN:
+    for name in UPSTREAM:
         assert name in out  # 候选名单让模型能自我纠正
 
 
+@needs_submodules
 def test_load_body_project_override_wins(tmp_path: Path):
     proj = tmp_path / ".agentd" / "skills" / "writing-plans"
     proj.mkdir(parents=True)
@@ -148,6 +192,7 @@ def test_load_body_project_override_wins(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@needs_submodules
 async def test_load_skill_tool_lists_and_loads(tmp_path: Path):
     from agentd.kernel.tools import NativeToolbox
 
@@ -160,6 +205,7 @@ async def test_load_skill_tool_lists_and_loads(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@needs_submodules
 async def test_load_skill_tool_unknown_name_gives_candidates(tmp_path: Path):
     from agentd.kernel.tools import NativeToolbox
 
@@ -169,14 +215,20 @@ async def test_load_skill_tool_unknown_name_gives_candidates(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 打包安全：内置技能目录里不允许混入专有内容
+# 许可安全：source-available 技能不得被暴露或捆绑
 # ---------------------------------------------------------------------------
 
 
-def test_no_source_available_document_skills_vendored():
-    """anthropics/skills 的 docx/pdf/pptx/xlsx 是 source-available，绝不能进包。"""
+def test_no_source_available_skills_exposed_or_vendored():
+    """anthropics/skills 的 docx/pdf/pptx/xlsx 是 source-available：
+    白名单不许点名，包内目录不许出现（submodule 引用本身没问题）。"""
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    for src in manifest.get("sources", []):
+        exposed = set(src.get("allow", []))
+        leak = exposed & _SOURCE_AVAILABLE
+        assert not leak, f"manifest 把 source-available 技能暴露给了模型：{leak}"
     bundled_root = Path(skills.__file__).parent / "skills"
-    for forbidden in ("docx", "pdf", "pptx", "xlsx"):
+    for forbidden in _SOURCE_AVAILABLE:
         assert not (bundled_root / forbidden).exists(), (
             f"{forbidden} 是 source-available 技能，不许捆绑进本仓库"
         )

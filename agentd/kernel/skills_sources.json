@@ -1,0 +1,21 @@
+{
+  "sources": [
+    {
+      "repo": "vendor/superpowers",
+      "subdir": "skills",
+      "allow": [
+        "systematic-debugging",
+        "verification-before-completion",
+        "test-driven-development",
+        "writing-plans"
+      ]
+    },
+    {
+      "repo": "vendor/anthropic-skills",
+      "subdir": "skills",
+      "allow": [
+        "skill-creator"
+      ]
+    }
+  ]
+}
