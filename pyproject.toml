@@ -20,6 +20,17 @@ agentd = "agentd.__main__:main"
 agentd-gateway = "agentd.transports.gateway:main"
 agentd-cli = "agentd.transports.cli:main"
 
+# 显式圈定包：vendor/（submodule 技能库）出现后，flat-layout 自动发现会
+# 把它误认为第二个顶层包直接拒绝构建（"Multiple top-level packages"）。
+# include 只收 agentd*，vendor/ 永远不进包（技能按原路径被运行时发现）。
+[tool.setuptools.packages.find]
+include = ["agentd*"]
+
+# kernel/skills/（内置技能的 SKILL.md 与脚本）和 skills_sources.json 是
+# 运行时数据：editable 安装按原路径读不受影响，wheel 安装靠这条带上。
+[tool.setuptools.package-data]
+"agentd.kernel" = ["skills/**/*", "skills_sources.json"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
