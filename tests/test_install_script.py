@@ -1,8 +1,8 @@
-"""scripts/install.py 的纯逻辑测试。
+"""install.py（仓库根）的纯逻辑测试。
 
 真安装（网络 + venv + pip）不在单测里跑 —— 这里只钉可离线验证的部分：
 路径校验、git 定位、submodule 状态解析、清单构建与原子写入。
-通过 importlib 从路径加载（scripts/ 不是包）。
+通过 importlib 从路径加载（单文件脚本，不在包结构里）。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "install.py"
+_SCRIPT = Path(__file__).resolve().parents[1] / "install.py"
 _spec = importlib.util.spec_from_file_location("agentd_install", _SCRIPT)
 install = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(install)
@@ -65,6 +65,27 @@ def test_find_git_fallback_candidates(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(install.Path, "home", lambda: tmp_path)
     got = install.find_git()
     assert Path(got).is_file()
+
+
+def test_git_env_prepends_portable_usr_bin(tmp_path: Path):
+    """PortableGit 落点向上找 usr/bin 前置进 PATH —— git-submodule 是 shell
+    脚本，没有 basename/sed 直接炸（真机踩过）。"""
+    fake = (
+        tmp_path / "portable" / "cmd" / "git.exe"
+    )
+    fake.parent.mkdir(parents=True)
+    core = tmp_path / "portable" / "usr" / "bin"
+    core.mkdir(parents=True)
+    env = install._git_env(str(fake))
+    assert env is not None
+    assert env["PATH"].startswith(str(core) + ";") or env["PATH"].startswith(str(core) + ":")
+
+
+def test_git_env_plain_layout_returns_none(tmp_path: Path):
+    """git.exe 周围没有 usr/bin（正规安装）→ 不动环境。"""
+    fake = tmp_path / "Git" / "cmd" / "git.exe"
+    fake.parent.mkdir(parents=True)
+    assert install._git_env(str(fake)) is None
 
 
 # ---------------------------------------------------------------------------

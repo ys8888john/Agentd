@@ -1,6 +1,6 @@
 """agentd 一键安装脚本：拉 submodule → 建 venv → 编译安装 → 写路径清单。
 
-以后端仓库为主角（本脚本住在 Agentd/scripts/），前端 GUI 仓库通过
+以后端仓库为主角（本脚本就住在 Agentd 仓库根），前端 GUI 仓库通过
 ``--gui <路径>`` 传进来，两个包**编进同一个 venv**（``~/.agentd/venv``）
 —— 这是 GUI 拉起 agentd 的标准姿势（acp_client 默认 ``sys.executable -m
 agentd.server``，同 venv 才能找到 agentd 模块）。
@@ -11,8 +11,8 @@ agentd.server``，同 venv 才能找到 agentd 模块）。
 
 用法（在 Agentd 仓库根）::
 
-    python scripts/install.py --gui ../ForgeAgent-GUI
-    python scripts/install.py --gui D:/workspace/ForgeAgent-GUI --force
+    python install.py --gui ../ForgeAgent-GUI
+    python install.py --gui D:/workspace/ForgeAgent-GUI
 
 只更新 submodule 与重装，不重建 venv —— 脚本幂等，重复跑就是升级。
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -29,7 +30,10 @@ from pathlib import Path
 
 # 单技能正文上限之类不放这 —— 本脚本只管装。技能是 agentd 运行时发现的。
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[0]
+
+# find_git() 命中后填充：git 子进程用的环境（PATH 前置 git 自带的 coreutils）。
+_GIT_ENV: dict[str, str] | None = None
 
 
 class InstallError(RuntimeError):
@@ -41,39 +45,63 @@ class InstallError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _git_env(git: str) -> dict[str, str] | None:
+    """git-submodule 是 shell 脚本，要 basename/sed 等 coreutils —— PortableGit
+    各落点布局不一（cmd/git.exe、mingw64/bin/git.exe），从 git.exe 所在目录向上
+    找带 ``usr/bin`` 的层，把它前置进 PATH。找不到就不动环境（git 在 PATH 上的
+    正规安装自带正确的 PATH）。"""
+    d = Path(git).resolve().parent
+    for _ in range(4):
+        core = d / "usr" / "bin"
+        if core.is_dir():
+            env = dict(os.environ)
+            env["PATH"] = str(core) + os.pathsep + env.get("PATH", "")
+            return env
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+
 def find_git(explicit: str | None = None) -> str:
     """定位 git 可执行文件。这台机器常见坑：git 不在 PATH 上（PortableGit）。"""
+    global _GIT_ENV
     if explicit:
         if Path(explicit).is_file():
+            _GIT_ENV = _git_env(explicit)
             return explicit
         raise InstallError(f"--git 指定的路径不存在：{explicit}")
     import shutil
 
     hit = shutil.which("git")
-    if hit:
-        return hit
-    # 常见落点的兜底探测（Windows 优先）：
-    candidates = [
-        Path("C:/Program Files/Git/cmd/git.exe"),
-        Path("C:/Program Files (x86)/Git/cmd/git.exe"),
-        # WorkBuddy 托管的 PortableGit（versions 下取 cmd/git.exe）
-        *sorted(
-            Path.home().glob(".workbuddy/binaries/PortableGit/versions/*/cmd/git.exe")
-        ),
-    ]
-    for cand in candidates:
-        if cand.is_file():
-            return str(cand)
-    raise InstallError(
-        "找不到 git。请用 --git <路径> 指定，或把 git 加进 PATH。\n"
-        "拉 submodule 没有它跑不动。"
-    )
+    if not hit:
+        # 常见落点的兜底探测（Windows 优先）：
+        candidates = [
+            Path("C:/Program Files/Git/cmd/git.exe"),
+            Path("C:/Program Files (x86)/Git/cmd/git.exe"),
+            Path("C:/Program Files/WorkBuddy/resources/vendor/PortableGit/mingw64/bin/git.exe"),
+            # WorkBuddy 托管的 PortableGit（versions 下取 cmd/git.exe）
+            *sorted(
+                Path.home().glob(".workbuddy/binaries/PortableGit/versions/*/cmd/git.exe")
+            ),
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                hit = str(cand)
+                break
+    if not hit:
+        raise InstallError(
+            "找不到 git。请用 --git <路径> 指定，或把 git 加进 PATH。\n"
+            "拉 submodule 没有它跑不动。"
+        )
+    _GIT_ENV = _git_env(hit)
+    return hit
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
     """跑一条命令，回传 stdout。失败抛 InstallError（带完整输出，别吞证据）。"""
     proc = subprocess.run(
-        cmd, cwd=str(cwd) if cwd else None,
+        cmd, cwd=str(cwd) if cwd else None, env=_GIT_ENV,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if check and proc.returncode != 0:
@@ -204,7 +232,19 @@ def write_manifest(home: Path, manifest: dict) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _harden_stdio() -> None:
+    """控制台编码不认的字符（如 emoji）不让它炸 UnicodeEncodeError —— 保留
+    原生编码（GBK 控制台中文照常显示），编不了的单字降级为 replace。
+    install.json 本来就显式 UTF-8 落盘，不受影响。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _harden_stdio()
     parser = argparse.ArgumentParser(
         description="agentd 一键安装：submodule → venv → 编译安装 → ~/.agentd/install.json"
     )
@@ -248,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print()
-    print("✅ 安装完成")
+    print("√ 安装完成")
     print(f"   路径清单：{manifest_path}")
     print(f"   技能：{', '.join(verify_out.get('skills', [])) or '（无）'}")
     print()
