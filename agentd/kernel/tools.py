@@ -1632,6 +1632,29 @@ async def _run_command(args: dict, rt: ToolRuntime) -> str:
     return f"exit=0：{command}\n{body}"
 
 
+async def _load_skill(args: dict, rt: ToolRuntime) -> str:
+    """load_skill：取一个技能的完整 SKILL.md；不带 name 时列出全部。"""
+    from . import skills as _skills  # 局部导入：skills 模块很轻，但避免环
+
+    name = str(args.get("name") or "").strip()
+    if not name or name == "list":
+        found = _skills.discover(rt.cwd)
+        if not found:
+            return (
+                "当前没有已安装的技能。把任何遵循 Agent Skills 标准的技能目录"
+                "（内含 SKILL.md）放进 ~/.agentd/skills/ 或工作目录的 "
+                ".agentd/skills/ 即可。"
+            )
+        lines = ["可用技能："]
+        for key, skill in sorted(found.items()):
+            desc = skill.description.strip().replace("\n", " ")
+            if len(desc) > 120:
+                desc = desc[:119] + "…"
+            lines.append(f"- {key}（{skill.source}）：{desc}")
+        return "\n".join(lines) + "\n\n用 load_skill {\"name\": \"技能名\"} 加载完整工作流。"
+    return _skills.load_body(name, rt.cwd)
+
+
 _SPECS: tuple[NativeTool, ...] = (
     NativeTool(
         name="read_file",
@@ -1837,6 +1860,27 @@ _SPECS: tuple[NativeTool, ...] = (
         },
         handler=_web_fetch,
         kind="fetch",
+    ),
+    NativeTool(
+        name="load_skill",
+        description=(
+            "加载一个已安装技能（Agent Skills / SKILL.md 标准）的完整工作流说明。"
+            "任务与 system prompt 里【可用技能】索引中的某条描述相关时，"
+            "**先加载再动手** —— 里面是该场景的成熟工作流与注意事项。"
+            "不记得确切名称时可不带参数列出全部。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能名（索引里的名称）；留空或传 list 则列出全部可用技能",
+                },
+            },
+            "required": [],
+        },
+        handler=_load_skill,
+        kind="read",
     ),
 )
 

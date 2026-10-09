@@ -363,8 +363,11 @@ async def test_memory_is_off_when_summary_every_is_zero(tmp_path):
         await _say(kernel, sid, f"第{i}句")
 
     assert llm.compacts == 0
-    # 只有固定那一段规范，末尾没有追加记忆块（记忆块以"关于用户"起头，见 render_memory_block）
-    assert all((s or "") == BEHAVIOR_GUIDE for s in llm.systems)
+    # 规范恒在；技能索引（load_skill 的路由段，2026-10-09 起）也允许出现 ——
+    # 这里要守的是**没有任何记忆漏进来**：记忆块以"关于用户"起头（见
+    # render_memory_block），system 里出现它就是半开关漏了。
+    assert all(s is not None and BEHAVIOR_GUIDE in s for s in llm.systems)
+    assert all("关于用户" not in (s or "") for s in llm.systems)
 
 
 async def test_summary_is_written_once_the_session_is_long_enough(tmp_path):

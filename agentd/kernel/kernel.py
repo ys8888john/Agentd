@@ -38,6 +38,7 @@ from .context import (
 from .memory import MemoryFile, compact, render_memory_block
 from .models import Message, ToolRecord
 from .modes import AgentMode, Mode, ModeContext, SingleMode
+from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
 
@@ -176,6 +177,12 @@ class AgentKernel:
                     sections.append(workspace_brief(Path(cwd)))
                 except OSError:
                     pass  # 目录被删了 / 没权限读：环境说明掉了不该整轮失败
+            # 技能索引：只在 load_skill 真被启用时注入（read_only/off 档没有
+            # 这个工具，给了索引模型也加载不了，反而诱导它空转）。
+            # 发现器自己吞掉所有 IO/格式错误 —— 索引失败顶多这轮没有技能可用，
+            # 不值得为它加 try 层。
+            if "load_skill" in TOOL_PROFILES[self.native_tools]:
+                sections.append(index_section(cwd or None))
         return compose_system(self.system, sections)
 
     async def _maybe_compact(self, session_id: str, rows: list[Message]) -> None:
