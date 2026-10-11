@@ -1,7 +1,8 @@
 """原生工具层：跑在 agentd 进程内的文件 / 命令 / 联网工具。
 
 当前原生工具：read_file / list_dir / glob / grep / write_file / edit / run_command /
-make_xlsx（纯标准库手写 .xlsx，见下方「Excel 生成」一节）/ web_search / web_fetch。
+make_xlsx（纯标准库手写 .xlsx，见下方「Excel 生成」一节）/ web_search / web_fetch /
+generate_image（文生图，配置见 _image_conf）。
 
 为什么不全部交给 MCP？MCP 的 stdio 客户端内部是 anyio task group，**必须与 enter/exit
 同 task**（见 mcp.py 开头的生命周期说明），所以现在每轮 run 都要现开现关一次子进程。
@@ -34,6 +35,7 @@ import html
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.parse
@@ -43,6 +45,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+
+from .blobstore import tool_results_root
 
 # ACP ToolKind 的子集：原生工具只用到这几个
 # （其余 delete/move/think/switch_mode 留给以后，声明了也没工具用得上）。
@@ -1655,6 +1659,187 @@ async def _load_skill(args: dict, rt: ToolRuntime) -> str:
     return _skills.load_body(name, rt.cwd)
 
 
+# ---------------------------------------------------------------------------
+# 图片生成（generate_image）：调 OpenAI 兼容的 /images/generations
+# ---------------------------------------------------------------------------
+
+# 常见图像接口的尺寸并集：OpenAI(DALL·E 3) 认 1024x1024/1024x1792/1792x1024，
+# 智谱 CogView 认 1024x1024/768x1344/864x1152，glm-image 文档示例 1280x1280。
+# provider 不支持的尺寸会原样报错回给模型，由它换一个重试。
+_IMAGE_SIZES = (
+    "1024x1024", "1280x1280", "1024x1792", "1792x1024",
+    "768x1344", "864x1152", "512x512",
+)
+_IMAGE_DEFAULT_SIZE = "1024x1024"
+
+_MIME_EXT = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+    "image/gif": ".gif", "image/bmp": ".bmp",
+}
+
+
+def _image_timeout() -> float:
+    """图像接口超时（秒）。出图比网页抓取慢得多，默认 120s，可用环境变量覆盖。"""
+    try:
+        return max(float(os.getenv("AGENTD_IMAGE_TIMEOUT") or 120), 5.0)
+    except ValueError:
+        return 120.0
+
+
+def _image_conf() -> dict:
+    """图像生成三件套（key / base_url / model），**每次调用时**读一次。
+
+    必须走 boot.env_value 而不是裸 os.getenv —— GUI「多媒体模型」设置写进热配置
+    （AGENTD_HOTENV 指向的 JSON），那份配置只进 current_settings、**不进
+    os.environ**（_zhipu_search_key 有过同款事故）。延迟导入 boot：boot 依赖
+    kernel，顶层 import 会成环。env_value 本身就是调用时求值，天然支持热切换。
+    """
+    vals = {"api_key": "", "base_url": "", "model": ""}
+    try:
+        from ..boot import env_value
+
+        vals["api_key"] = env_value("AGENTD_IMAGE_API_KEY", "")
+        vals["base_url"] = env_value("AGENTD_IMAGE_BASE_URL", "")
+        vals["model"] = env_value("AGENTD_IMAGE_MODEL", "")
+    except Exception:  # noqa: BLE001 - 取不到就回落进程环境，绝不因配置读取报错
+        pass
+    for key, env_name in (
+        ("api_key", "AGENTD_IMAGE_API_KEY"),
+        ("base_url", "AGENTD_IMAGE_BASE_URL"),
+        ("model", "AGENTD_IMAGE_MODEL"),
+    ):
+        if not vals[key]:
+            vals[key] = os.getenv(env_name, "")
+    return vals
+
+
+async def _image_http_post(
+    url: str, payload: dict, headers: dict, timeout: float
+) -> tuple[int, dict]:
+    """POST 图像接口，返回 (status, body dict)；网络层失败 status=0。
+
+    抽成模块级函数就是为了测试能 monkeypatch（与 _fetch_once 同款思路）。
+    """
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
+            resp = await client.post(url, json=payload)
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"error": (resp.text or "")[:400]}
+            return resp.status_code, body if isinstance(body, dict) else {}
+    except Exception as exc:  # noqa: BLE001 - 网络/超时/非 JSON 一视同仁
+        return 0, {"error": f"{type(exc).__name__}: {exc}"}
+
+
+async def _image_http_get_bytes(
+    url: str, headers: dict, timeout: float
+) -> tuple[bytes, str]:
+    """回源取一张图（url 型响应），返回 (bytes, content_type)。"""
+    async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content, str(resp.headers.get("content-type") or "")
+
+
+def _image_error_body(detail: object) -> str:
+    """把 provider 的 error 字段折成一行人话（可能是 str / dict / 任意 JSON）。"""
+    if isinstance(detail, dict):
+        msg = detail.get("message") or json.dumps(detail, ensure_ascii=False)
+    else:
+        msg = str(detail or "")
+    return msg.strip()[:400] or "（无错误详情）"
+
+
+async def _generate_image(args: dict, rt: ToolRuntime) -> str:
+    """generate_image：文字生图，落盘 tool_results 并以「已新建 <路径>」回报。
+
+    输出措辞是跨仓库契约：GUI 从「已新建/已覆盖/已修改 <路径>（」里正则提取产物
+    路径渲染产物卡（index.html 的 ARTIFACT_RE），所以开头必须是「已新建 <path>」，
+    且成功时不能以 [错误] 开头。
+    """
+    import secrets
+
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return err("提示词为空：告诉我要画什么")
+
+    conf = _image_conf()
+    if not conf["api_key"] or not conf["model"]:
+        return err(
+            "未配置图像生成模型：在 GUI「模型配置 → 多媒体模型」里设置"
+            "「默认图像生成模型」（会自动带上当前 provider 的 key 和地址），"
+            "或手动设置环境变量 AGENTD_IMAGE_API_KEY / AGENTD_IMAGE_BASE_URL / AGENTD_IMAGE_MODEL"
+        )
+
+    size = str(args.get("size") or "").strip() or _IMAGE_DEFAULT_SIZE
+    if size not in _IMAGE_SIZES:
+        return err(f"不支持的尺寸 {size}，可选：{' / '.join(_IMAGE_SIZES)}")
+
+    base = (conf["base_url"] or "https://api.openai.com/v1").rstrip("/")
+    url = f"{base}/images/generations"
+    headers = {"Authorization": f"Bearer {conf['api_key']}", "Accept": "application/json"}
+    payload = {
+        "prompt": prompt,
+        "model": conf["model"],
+        "n": 1,
+        "size": size,
+        "response_format": "b64_json",
+    }
+    timeout = _image_timeout()
+
+    status, body = await _image_http_post(url, payload, headers, timeout)
+    if status == 0:
+        return err(f"图像接口请求失败：{_image_error_body(body.get('error'))}")
+    if status >= 400:
+        return err(f"图像接口返回 {status}：{_image_error_body(body.get('error'))}")
+
+    items = body.get("data") if isinstance(body.get("data"), list) else []
+    b64 = ""
+    mime = "image/png"
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_b64 = item.get("b64_json")
+        if raw_b64:
+            b64 = str(raw_b64)
+            mime = str(item.get("mime_type") or mime)
+            break
+        img_url = item.get("url")
+        if img_url:
+            try:
+                raw, ctype = await _image_http_get_bytes(str(img_url), headers, timeout)
+            except Exception as exc:  # noqa: BLE001 - 回源失败要能被模型看见并重试
+                return err(f"回源取图失败：{type(exc).__name__}: {exc}")
+            b64 = base64.b64encode(raw).decode("ascii")
+            mime = (ctype.split(";")[0].strip() or mime) if ctype else mime
+            break
+    if not b64:
+        return err("图像接口没有返回图像数据（既不是 b64_json 也不是 url）")
+
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as exc:  # noqa: BLE001
+        return err(f"图像数据解码失败：{type(exc).__name__}: {exc}")
+    if not raw:
+        return err("图像数据解码后为空")
+
+    root = tool_results_root() / "imagegen"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        ext = _MIME_EXT.get(mime, ".png")
+        path = root / f"image_{int(time.time())}_{secrets.token_hex(4)}{ext}"
+        path.write_bytes(raw)
+    except OSError as exc:
+        return err(f"写图片文件失败：{type(exc).__name__}: {exc}")
+
+    kb = len(raw) / 1024
+    return (
+        f"已新建 {path}（{size}，{kb:.0f}KB，模型 {conf['model']}）。"
+        f"图片已生成完毕，请告诉用户图片已就绪，不要在正文里重复描述画面。"
+    )
+
+
 _SPECS: tuple[NativeTool, ...] = (
     NativeTool(
         name="read_file",
@@ -1881,6 +2066,34 @@ _SPECS: tuple[NativeTool, ...] = (
         },
         handler=_load_skill,
         kind="read",
+    ),
+    NativeTool(
+        name="generate_image",
+        description=(
+            "根据文字描述生成一张图片（文生图），返回落盘的图片文件路径。"
+            "用户想「画 / 生成 / 做一张图、海报、头像、照片」时用它 —— "
+            "这是真正的图像生成模型，不要用 write_file 伪造图片。"
+            "prompt 要写成具体、细节丰富的画面描述（主体 / 场景 / 风格 / 光线）。"
+            "一次生成一张；用户要多张就连调多次。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "画面描述，越具体越好（主体、场景、风格、构图、光线）",
+                },
+                "size": {
+                    "type": "string",
+                    "enum": list(_IMAGE_SIZES),
+                    "description": "图片尺寸，默认 1024x1024；竖图选 768x1344，横图选 1792x1024",
+                },
+            },
+            "required": ["prompt"],
+        },
+        handler=_generate_image,
+        kind="other",
+        requires_permission=False,
     ),
 )
 

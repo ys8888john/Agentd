@@ -97,6 +97,10 @@ curl -s localhost:8765/v1/sessions/sess_…/permission \
 | `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none` | `native` |
 | `AGENTD_SEARCH_ENDPOINT` | `web_search` 的搜索后端地址 | `https://cn.bing.com/search` |
 | `AGENTD_SOGOU_ENDPOINT` | `web_search` 的搜狗兜底后端地址 | `https://www.sogou.com/web` |
+| `AGENTD_VISION_BASE_URL` / `_HOST` | 视觉转译模型的端点（`_HOST` 走 Ollama 原生，二选一） | 空（= 功能关） |
+| `AGENTD_VISION_MODEL` / `_API_KEY` | 视觉转译用的模型名 / 密钥 | 空 / 空 |
+| `AGENTD_IMAGE_BASE_URL` / `_MODEL` / `_API_KEY` | 图像生成：OpenAI 兼容 `images/generations` 的三件套 | 空（= `generate_image` 不可用） |
+| `AGENTD_IMAGE_TIMEOUT` | 图像生成单次请求超时（秒） | `120` |
 
 ### `script` 后端：不靠模型也能验工具链
 
@@ -206,6 +210,36 @@ provider 在**下一轮对话**即生效，不用重启进程。
 `ErrorEvent`（不会让整轮对话挂掉）。注意：**store 路径、工具策略、审批策略这类结构性
 配置仍是启动定死**，热加载它们会带来数据/安全风险，不在本次范围内。
 
+### 多媒体子模型：视觉转译 + 图像生成
+
+主模型不一定是"全能"的 —— 本机 qwen3.5 看不了图，`glm-4.5-air` 画不了图。与其逼用户
+换主模型，不如让 agentd 在主模型之外**再挂两个专用子模型**，各管一件事：
+
+| 子模型 | 配置前缀 | 谁在用 | 没配会怎样 |
+|---|---|---|---|
+| 视觉转译 | `AGENTD_VISION_*` | `kernel/vision.py`，含图消息进主模型前先把图"代看"成文字 | 功能关：图片块原样放行，行为与没有这一层完全一致 |
+| 图像生成 | `AGENTD_IMAGE_*` | `generate_image` 原生工具 | 工具仍在工具表里，但一调就回"未配置图像生成模型，请到…多媒体模型设置里填一个" |
+
+两者都**不另起一套密钥体系**：GUI 的「多媒体模型设置」只让你填**模型名**，
+端点与密钥由 ForgeAgent-GUI 从当前 profile 自己的 `AGENTD_OPENAI_*` /
+`AGENTD_ZHIPU_*` / `AGENTD_MIMO_*` 推导出来写进 `hotenv.json`（Ollama profile
+则推导 `AGENTD_OLLAMA_HOST`）。所以在这台机器上"选了 zhipu-glm 又能画图"不需要
+第二次填 key —— 但要记住**图像必须走图像模型**（如 `glm-image` / `cogview-3-plus`）：
+拿 `glm-4.5-air` 去打 `/images/generations`，智谱返回的是 HTTP 500。
+
+三个实现决定：
+
+- **配置走 `boot.env_value`，不走裸 `os.getenv`。** GUI 热切换写的是 `hotenv.json`，
+  它进的是 `current_settings()` 而**不是** `os.environ`；裸 `os.getenv("AGENTD_IMAGE_MODEL")`
+  在热切换后永远返回空串（2026-10-08 `_zhipu_search_key` 那次就是这么踩的）。
+- **调用时读，不是 import 时读。** `_image_conf()` / `VisionInterpreter._resolve()`
+  每次都重新取一遍，于是 GUI 改完下一轮就生效、无需重启 agentd。
+- **失败不外抛。** 视觉转述失败塞一句 `[图片转述失败：…]` 文本让主模型能讲清楚；
+  图像生成失败回 `[错误] …` 文案（提示词空 / 尺寸不合法 / HTTP 码 / 网络不通 /
+  返回无数据 / 解码失败 / 写盘失败各有各的说法），整轮对话照常继续。
+- **清空要写空串，不能删键。** ForgeAgent-GUI 的 `save_models` 是"缺的键沿用旧值"
+  的合并语义（为了保住被打码的 API key），所以删键等于没删，必须显式写 `""`。
+
 ## 模式：single / agent
 
 | 模式 | 行为 |
@@ -262,6 +296,7 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 | `make_xlsx` | `execute` | **是** | 把二维数据落成真正的 `.xlsx`（纯标准库手写，无第三方依赖） |
 | `web_search` | `search` | 否 | Bing 搜网页（答非所问时自动换搜狗重试），回"标题 + 直链 + 摘要"，`count` 上限 10 |
 | `web_fetch` | `fetch` | 否 | 抓一个 http(s) 页面，剥成纯文本（最多 2MB） |
+| `generate_image` | `other` | 否 | 按提示词出图（OpenAI 兼容 `images/generations`），落盘后回"已新建 <path>" |
 
 `write_file` / `edit` 的输出带 unified diff（行首 `--- / +++ / @@ / - / +`，
 上下文 2 行、超长截断），客户端据此在工具卡片里直接渲染改动前后对比。
@@ -280,6 +315,33 @@ agent 模式下的工具来自两条路，对模型完全透明（合并成一�
 （`..` 会被 `resolve` 展开后再判，`AGENTD_TOOLS_ALLOW_OUTSIDE=true` 才放开）；
 单次返回文本上限 64KB；`make_xlsx` 上限 20000 行 × 200 列；
 `run_command` 默认 30 秒超时、非零退出码按失败上报。
+
+**`generate_image`：为什么是原生工具、而不是界面上的一个按钮。**
+
+早期版本在 GUI 上做了一个独立的「🎨 生成图片」面板，绕开 agentd 直接打图像接口。
+它有两个绕不过去的问题：一是**必须自己点按钮**，用户说一句"帮我生成一张小鸭子游泳的
+照片"时主模型无动于衷；二是生成出来的图是一个**孤立的面板**，不进会话、不进历史、
+和 agent 正在做的事毫无关系。所以改成原生工具：
+
+```
+用户："帮我生成一张小鸭子游泳的照片"
+  → 主模型判意图 → tool_call generate_image(prompt=…, size=…)
+  → HTTP POST {AGENTD_IMAGE_BASE_URL}/images/generations
+  → 字节落到 tool_results_root()/imagegen/image_<ts>_<rand><ext>
+  → 输出 "已新建 <绝对路径>（1024x1024，37KB，模型 glm-image）。…"
+  → 客户端按跨仓库产物契约把它渲染成一张产物卡片
+```
+
+三点值得记：
+
+- **输出必须以 `已新建 <路径>（` 开头。** agentd 没有 `file_info` 事件，GUI 是靠
+  `ToolCallDone.output` 上的正则（`/已(?:新建|覆盖|修改)(?:\s+Excel\s*文件)?\s+([^\n（(：]+)/`）
+  把产物卡片挖出来的。写成 `生成成功：xxx` 界面就只剩一张没有附件的卡片。
+- **`kind="other"` + `requires_permission=False`。** 于是默认 `native` 审批策略下
+  它**不弹审批**（`needs_approval` 对非写非执行类返回 False）。出图是一次网络调用，
+  弹窗在这里没有意义；端到端脚本会断言全程 0 次审批。
+- **不受 cwd 白名单约束。** 产物写进 blobstore 的 `tool_results_root()`，
+  不是会话目录 —— 否则"换个会话就打不开上次生成的图"。该目录已在产物白名单内。
 
 **为什么不全走 MCP。** MCP 的 stdio 客户端内部是 anyio task group，
 必须与 enter/exit 同 task，所以现在每轮 run 都要现开现关一次子进程
@@ -618,6 +680,16 @@ firewall=false
 - **原生工具的路径必须 `resolve()` 之后再判越界。** 直接字符串比较
   `startswith(cwd)` 会放过 `../`，`Path.resolve()` 把 `..` 和符号链接都展开过，
   再 `relative_to(root)` 才是可靠的判据（`test_path_escape_outside_root_is_rejected`）。
+- **子模型配置必须走 `boot.env_value`，不能裸 `os.getenv`。** `AGENTD_IMAGE_*` /
+  `AGENTD_VISION_*` 往往来自 GUI 的 `hotenv.json`，它只进 `current_settings()`，
+  **不写 `os.environ`** —— 裸 `getenv` 拿到的永远是空串（2026-10-08 `_zhipu_search_key`）。
+  而且要**在调用时读**（`_image_conf()` / `_resolve()` 每次重取），写成模块级常量初值
+  的话 GUI 改完不重启就不生效，单测 monkeypatch 也会失效。
+- **清空子模型配置要写空串，不能 `pop` 键。** ForgeAgent-GUI 的 `save_models` 是
+  "缺的键沿用旧值"（为了保住被打码的 key），删键等于没删。
+- **图像生成必须用图像模型。** 智谱 `glm-4.5-air` 打 `/images/generations` 返回
+  HTTP 500，只有 `glm-image` / `cogview-3-plus` 这类才行（`/v4/models` 里那 11 个
+  全是文本模型，看名字分不出来，得靠"多媒体模型设置"显式指定）。
 - **搜索必须伪装成浏览器 UA。** 用 `httpx` 的默认 UA 会被 Bing 直接挡掉，而且
   **不报错** —— 它返回的是一个正常 HTML 页面，只是里面一个 `b_algo` 块都没有，
   现象是"搜索永远回'没能从结果页解析出条目'，看着像解析器坏了"。UA 在 `_WEB_HEADERS`。
@@ -654,6 +726,15 @@ pytest -q
 MCP 工具循环的测试分三层：`AgentMode` 用假 Hub 测循环逻辑、`McpHub` 连真 stdio
 echo server 测集成、`kernel.handle(mode="agent")` 测端到端。整条链路的真实验证
 （含前端）在 ForgeAgent-GUI 的 `scripts/mcp_e2e.py`。
+
+图像生成有独立的一套 `tests/test_generate_image_tool.py`（13 个用例）：工具登记 /
+kind / 免审批、喂给 LLM 的 schema（`size.enum` 与常量表一致）、提示词为空、
+未配置时的**可行动**报错、非法尺寸、`b64_json` 落盘、`url` 形态回源再抓、HTTP 错误码
+透出、网络失败、返回无数据，以及两条**配置优先级**用例（`env_value` 优先于
+`os.environ`、无配置时回落 `os.environ`），最后一条是 `AgentMode` 端到端（工具真被
+喂给 LLM、kind 正确、状态 `completed`、输出以 `已新建 ` 开头、0 次审批、文件真在盘上）。
+它的 fixture 刻意**不**打桩 `_image_conf`，只替换 `boot.env_value` —— 否则那两条
+配置优先级用例测的就是桩本身。
 
 原生工具的测试在 `tests/test_native_tools.py`，分七块：
 
