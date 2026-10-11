@@ -41,6 +41,7 @@ from .modes import AgentMode, Mode, ModeContext, SingleMode
 from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
+from .vision import VisionInterpreter
 
 class UnknownModeError(KeyError):
     """请求的模式未注册。"""
@@ -78,6 +79,10 @@ class AgentKernel:
     # 上下文预算。**用 callable 而不是一个 int**：GUI 的 token 预算是按模型 profile
     # 热写的（本地 8b 与云端 GLM 差三倍以上），启动定死会让"切了模型预算还是旧值"。
     context_budget: Callable[[], int] = field(default_factory=lambda: lambda: 0)
+    # ---- 视觉转译层（kernel/vision.py）----
+    # 配置取数回调（boot.env_value），None = 功能关。传了就造解释器：消息里
+    # 有图且配置了 AGENTD_VISION_* 时，图片块会被转述成文字再喂给主模型。
+    vision_config_fn: Callable[[str, str], str] | None = None
 
     def __post_init__(self) -> None:
         self._modes: dict[str, Mode] = {}
@@ -90,6 +95,9 @@ class AgentKernel:
         # 每个会话的"固定开销已超触发线"提醒过没有（见 _warn_about_overhead）
         self._overhead_warned: dict[str, bool] = {}
         self._memory = MemoryFile(self.memory_file)
+        self._vision = (
+            VisionInterpreter(self.vision_config_fn) if self.vision_config_fn else None
+        )
         self.register(SingleMode())
         self.register(AgentMode())
 
@@ -432,7 +440,7 @@ class AgentKernel:
     async def handle(
         self,
         session_id: str,
-        user_input: str,
+        user_input: str | list[dict],
         *,
         mode: str = "single",
         approve: ApproveHandler | None = None,
@@ -442,6 +450,9 @@ class AgentKernel:
 
         约定：末尾必发 Done；失败时先 ErrorEvent 再 Done(stop_reason="error")；
         同一 session 多次 handle 串行执行（history 有序，并行会写乱）。
+
+        `user_input` 通常是 str；多模态输入（用户发了图）是 OpenAI 视觉格式的
+        内容块列表，见 models.Message.content 的注释 —— 原样落库、原样进窗口。
 
         `approve` 是审批回调（工具要写文件/跑命令时用），由传输层注入；
         不传等于"无人可问"，一律放行。
@@ -524,6 +535,15 @@ class AgentKernel:
                     # 记忆要重读：刚才压出来的摘要此刻才对得上窗口移走的那一段
                     memory = await self._recall(session_id, own=own_summary)
                     system = self._system_prompt(opts, memory)
+
+            # ---- 视觉转译层：主模型不支持视觉时，图片块在这里被换成文字转述 ----
+            # 必须放在**窗口切完、压缩补切之后**：两条切窗路径汇合到这里，
+            # 只挂一处才不会漏。转译产生的说明文本会略微膨胀窗口，溢出由
+            # LiveLLM._trim 的硬裁剪兜底（那是每次真实 LLM 调用的必经之路）。
+            if self._vision is not None:
+                history, vision_note = await self._vision.annotate(history)
+                if vision_note:
+                    yield Notice(session_id=session_id, run_id=run_id, text=vision_note)
 
             ctx = ModeContext(
                 session_id=session_id,

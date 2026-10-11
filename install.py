@@ -92,7 +92,8 @@ def find_git(explicit: str | None = None) -> str:
     if not hit:
         raise InstallError(
             "找不到 git。请用 --git <路径> 指定，或把 git 加进 PATH。\n"
-            "拉 submodule 没有它跑不动。"
+            "拉 submodule 没有它跑不动。本机常见路径：\n"
+            "  --git C:\\Users\\Administrator\\.workbuddy\\binaries\\PortableGit\\versions\\1.2.0\\cmd\\git.exe"
         )
     _GIT_ENV = _git_env(hit)
     return hit
@@ -243,8 +244,38 @@ def _harden_stdio() -> None:
             pass
 
 
+def check_runtime() -> None:
+    """启动期自检：把「运行环境不对」这件事大声说出来，而不是静默失败。
+
+    本机常见坑：``.py`` 文件关联指向 Microsoft Store 占位 python
+    （``AppData\\Local\\Microsoft\\WindowsApps\\python.exe``），它不执行脚本，
+    只弹 Store / 静默退出 —— 表现就是 ``.\\install.py`` 一闪而过、毫无输出。
+    agentd 还要求 Python >= 3.11。两种情况都直接给可照做的修正命令。
+    """
+    exe = sys.executable
+    ver = sys.version.split()[0]
+    print(f"[env] 运行解释器：{exe}  (Python {ver})")
+    low = exe.lower().replace("/", "\\")
+    if "windowsapps" in low:
+        raise InstallError(
+            "你正在用 Microsoft Store 的占位 python（WindowsApps\\python.exe），"
+            "它不会执行脚本，所以 install.py 其实什么都没跑。\n"
+            "请改用真实解释器显式启动，例如本机托管版：\n"
+            "  C:\\Users\\Administrator\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe"
+            " D:\\workspace\\Agentd\\install.py"
+            " --git C:\\Users\\Administrator\\.workbuddy\\binaries\\PortableGit\\versions\\1.2.0\\cmd\\git.exe\n"
+            "（任意 3.11+ 的真实解释器均可；不要直接 ``.\\install.py``）"
+        )
+    if sys.version_info < (3, 11):
+        raise InstallError(
+            f"Python {ver} 太旧，agentd 要求 >= 3.11。"
+            "请用 3.11+ 的解释器显式启动 install.py。"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     _harden_stdio()
+    check_runtime()
     parser = argparse.ArgumentParser(
         description="agentd 一键安装：submodule → venv → 编译安装 → ~/.agentd/install.json"
     )

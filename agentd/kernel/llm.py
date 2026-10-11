@@ -159,6 +159,27 @@ def _as_args_obj(arguments: str) -> Any:
         return {}
 
 
+def _split_multimodal(content: list[dict]) -> tuple[str, list[str]]:
+    """把多模态 content 拆成（纯文本, base64 图片列表）。
+
+    图片块的 url 是 data URI（data:<mime>;base64,<b64>），剥掉前缀只留 base64 ——
+    Ollama 的 /api/chat 要的就是裸 base64 数组。
+    """
+    texts: list[str] = []
+    images: list[str] = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text":
+            texts.append(str(p.get("text") or ""))
+        elif p.get("type") == "image_url":
+            url = str((p.get("image_url") or {}).get("url") or "")
+            b64 = url.split(",", 1)[1] if url.startswith("data:") and "," in url else url
+            if b64:
+                images.append(b64)
+    return "\n".join(t for t in texts if t), images
+
+
 def _with_system(messages: list[Message], system: str | None, *, ollama: bool = False) -> list[dict]:
     """把 system 塞到最前，并按线格式序列化工具相关字段。
 
@@ -166,12 +187,20 @@ def _with_system(messages: list[Message], system: str | None, *, ollama: bool = 
       role="tool" 带 tool_call_id。
     - ollama=True：tool_calls 的 arguments 还原成对象、不带 id/type；工具结果用 tool_name。
     - name=None 一律不写，避免出现 "name": null。
+    - 多模态 content（list）：OpenAI 兼容端点直接透传 image_url 内容块；
+      Ollama 端点翻成 content=纯文本 + images=[裸 base64]（它的 /api/chat 形状）。
     """
     out: list[dict] = []
     if system:
         out.append({"role": "system", "content": system})
     for m in messages:
-        item: dict[str, Any] = {"role": m.role, "content": m.content}
+        if isinstance(m.content, list) and ollama:
+            text, images = _split_multimodal(m.content)
+            item: dict[str, Any] = {"role": m.role, "content": text}
+            if images:
+                item["images"] = images
+        else:
+            item = {"role": m.role, "content": m.content}
         if m.role == "assistant" and m.tool_calls:
             if ollama:
                 item["tool_calls"] = [
@@ -465,20 +494,30 @@ class OpenAICompatLLM(LLM):
         for attempt in range(RATE_LIMIT_RETRIES + 1):  # 首次 + 5 次重试
             pending: dict[int, dict[str, str]] = {}
             yielded = False
+            body = self._payload(messages, system, model, tools)
+            # 请求里带图时，端点 400 的高频原因是"纯文本模型收了 image 块"
+            # （如 glm-4.5-air 只收 content.type=[text]）。提前探好，报错时给人话。
+            has_images = any(m.content_images() for m in messages)
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                     async with client.stream(
                         "POST",
                         f"{self.base_url}/chat/completions",
-                        json=self._payload(messages, system, model, tools),
+                        json=body,
                         headers=headers,
                     ) as resp:
                         if resp.status_code >= 400:
                             detail = (await resp.aread()).decode("utf-8", "replace").strip()
+                            hint = ""
+                            if has_images and resp.status_code == 400:
+                                hint = (
+                                    "｜当前模型可能不支持图片输入（视觉模型才收 image 类型），"
+                                    "请切换视觉模型，或配置 AGENTD_VISION_* 让视觉模型代看"
+                                )
                             raise _AttemptFailed(
                                 resp.status_code,
                                 f"OpenAI 兼容端点 HTTP {resp.status_code}："
-                                f"{detail[:300] or '（空响应体）'}（当前模型 {model}）",
+                                f"{detail[:300] or '（空响应体）'}（当前模型 {model}）{hint}",
                             )
                         # 兼容端点是 SSE（逐行 `data: {...}`），遇 [DONE] 收尾
                         async for line in resp.aiter_lines():

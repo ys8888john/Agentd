@@ -44,10 +44,19 @@ class ToolRecord(BaseModel):
 
 class Message(BaseModel):
     """一条对话消息。Pydantic 一次定义，内存/JSON 序列化都免费拿到；
-    model_dump() 直接是 OpenAI /chat/completions 的 {role, content} 格式。"""
+    model_dump() 直接是 OpenAI /chat/completions 的 {role, content} 格式。
+
+    content 两种形态：
+      - str：普通文本消息（绝大多数）。
+      - list[dict]：多模态内容（用户发了图片），OpenAI 视觉格式 ——
+          [{"type":"text","text":"..."},
+           {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+        llm._with_system 负责按后端（OpenAI 兼容 / Ollama）翻成线格式；
+        其余消费方（token 估算、记忆压缩、历史回放）用 content_text() 取纯文本。
+    """
 
     role: Role
-    content: str = Field(default="")
+    content: str | list[dict] = Field(default="")
 
     # 只给 role="tool" 用；允许 None 让 model_dump(exclude_none=True) 剔掉它，
     # 避免发给 OpenAI 兼容端点多出 "name": null。注意 `= None` 才表示可空且默认 None。
@@ -62,7 +71,7 @@ class Message(BaseModel):
     tool_record: ToolRecord | None = None
 
     @classmethod
-    def user(cls, content: str) -> "Message":
+    def user(cls, content: str | list[dict]) -> "Message":
         return cls(role="user", content=content)
 
     @classmethod
@@ -76,6 +85,30 @@ class Message(BaseModel):
     @classmethod
     def tool(cls, content: str, *, tool_call_id: str, name: str | None = None) -> "Message":
         return cls(role="tool", content=content, tool_call_id=tool_call_id, name=name)
+
+    def content_text(self) -> str:
+        """多形态 content 的纯文本视图（token 估算 / 展示 / 压缩都用它）。
+
+        list 内容时拼接 text 块，图片块换成 [图片] 占位（base64 不该出现在
+        记录压缩、日志这些文本场景里）。
+        """
+        if isinstance(self.content, str):
+            return self.content
+        parts: list[str] = []
+        for p in self.content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text":
+                parts.append(str(p.get("text") or ""))
+            elif p.get("type") == "image_url":
+                parts.append("[图片]")
+        return "\n".join(x for x in parts if x)
+
+    def content_images(self) -> list[dict]:
+        """list 内容里的图片块原样取出（llm 序列化用）；str 内容返回空。"""
+        if not isinstance(self.content, list):
+            return []
+        return [p for p in self.content if isinstance(p, dict) and p.get("type") == "image_url"]
 
     @classmethod
     def from_tool_record(cls, record: ToolRecord) -> "Message":

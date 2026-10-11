@@ -229,7 +229,7 @@ def render_transcript(messages: list[Message], max_chars: int = TRANSCRIPT_MAX_C
     lines: list[str] = []
     for m in messages:
         label = _ROLE_LABELS.get(m.role, m.role)
-        body = (m.content or "").strip()
+        body = m.content_text().strip()
         if m.role == "assistant" and m.tool_calls and not body:
             # 只举手要调工具、没说话的 assistant：content 是空的，
             # 直接跳过会丢掉"这一步是靠工具走的"这个信息，补一句。

@@ -57,6 +57,9 @@ _SAFETY_MARGIN = 1.1          # 上浮 10%：估大不估小
 _PER_MESSAGE = 4
 # 一次 tool_call 的包裹开销：{"id":"..","type":"function","function":{"name":"..","arguments":".."}}
 _PER_TOOL_CALL = 10
+# 每张图片的 token 估算：base64 本体可能上百 KB，但视觉模型按图块/分辨率计费，
+# 保守按一张中等分辨率图 ~1k token 算（各家 300~1600 不等，取偏大值估大不估小）。
+_PER_IMAGE = 1000
 
 
 def estimate_tokens(text: str) -> int:
@@ -80,8 +83,16 @@ def estimate_message_tokens(message: Message) -> int:
 
     role="tool" 的内容常常是几十 KB 的工具输出，是全序列里最容易爆掉的一块，
     所以这里必须连 arguments / output 一起算，只算 content 会严重低估。
+
+    多模态 content（list）：文本块按字符估，图片块每张按 _PER_IMAGE 计
+    （base64 不能拿字符数估，会得出几万 token 的荒谬值）。
     """
-    total = _PER_MESSAGE + estimate_tokens(message.content)
+    total = _PER_MESSAGE + estimate_tokens(message.content_text())
+    if isinstance(message.content, list):
+        total += _PER_IMAGE * sum(
+            1 for p in message.content
+            if isinstance(p, dict) and p.get("type") == "image_url"
+        )
     for call in message.tool_calls or []:
         total += _PER_TOOL_CALL + estimate_tokens(call.name) + estimate_tokens(call.arguments)
     if message.name:

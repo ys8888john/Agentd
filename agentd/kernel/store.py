@@ -11,6 +11,7 @@ tests/test_store.py 用同一套契约测试对两个实现各跑一遍。
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -256,6 +257,13 @@ class SqliteSessionStore(SessionStore):
     def _append_sync(self, session_id: str, message: Message) -> None:
         if not self._exists_sync(session_id):
             raise UnknownSessionError(session_id)
+        # content 冗余列（TEXT）要能直查：多模态 list 序列化成 JSON 字符串存，
+        # 权威数据始终在 payload 列（model_dump_json）。
+        content_col = (
+            json.dumps(message.content, ensure_ascii=False)
+            if isinstance(message.content, list)
+            else message.content
+        )
         with self._conn:
             self._conn.execute(
                 "INSERT INTO messages (session_id, role, content, name, payload, created_at)"
@@ -263,7 +271,7 @@ class SqliteSessionStore(SessionStore):
                 (
                     session_id,
                     message.role,
-                    message.content,
+                    content_col,
                     message.name,
                     message.model_dump_json(),
                     time.time(),

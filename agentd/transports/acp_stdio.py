@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import sys
 from typing import Any
 
@@ -293,7 +294,7 @@ class AgentdAcpAgent(Agent):
     async def prompt(
         self, session_id: str, prompt: list[Any], **kwargs: Any
     ) -> PromptResponse:
-        text = self._extract_text(prompt)
+        content = self._extract_content(prompt)
         # 默认走 agent 模式（无工具时与 single 等价，有 MCP server 时才会触发工具循环）
         mode = self._session_modes.get(session_id, "agent")
 
@@ -307,7 +308,7 @@ class AgentdAcpAgent(Agent):
 
         try:
             async for event in self._kernel.handle(
-                session_id, text, mode=mode, approve=self._make_approver(session_id, cancel), cancel=cancel
+                session_id, content, mode=mode, approve=self._make_approver(session_id, cancel), cancel=cancel
             ):
                 if isinstance(event, MessageDelta):
                     await self._conn.session_update(
@@ -379,18 +380,62 @@ class AgentdAcpAgent(Agent):
 
         return PromptResponse(stop_reason=stop_reason)
 
-    def _extract_text(self, blocks: list[Any]) -> str:
-        parts: list[str] = []
+    def _extract_content(self, blocks: list[Any]) -> str | list[dict]:
+        """从 ACP prompt blocks 抽出喂给内核的用户内容。
+
+        - 纯文本 → 返回 str（绝大多数轮次，旧行为不变）。
+        - 含图片 → 返回 OpenAI 视觉格式的内容块列表（见 models.Message.content）：
+            [{"type":"text","text":...},
+             {"type":"image_url","image_url":{"url":"data:<mime>;base64,..."}}]
+          图片字节优先取 block.data（客户端已在发送前 base64 编码）；若 data
+          为空但 uri 是 file:// 本地路径（同机部署的省流量形态），读文件兜底。
+        - 其余类型（audio/resource…）照旧忽略并记日志。
+
+        纯图无文也放行（"这张图里是什么"不带正文是合法输入）；
+        两者皆空才报错。
+        """
+        text_parts: list[str] = []
+        image_parts: list[dict] = []
         for block in blocks:
-            t = getattr(block, "text", None)
-            if t:
-                parts.append(t)
+            btype = getattr(block, "type", None)
+            if btype is None and getattr(block, "text", None):
+                # 兼容不带 type 的鸭子类型（旧测试 / 手搓块）：有 text 就当文本
+                btype = "text"
+            if btype == "text":
+                t = getattr(block, "text", None)
+                if t:
+                    text_parts.append(t)
+            elif btype == "image":
+                b64 = getattr(block, "data", None) or ""
+                mime = getattr(block, "mime_type", None) or "image/png"
+                uri = getattr(block, "uri", None) or ""
+                if not b64 and uri:
+                    path = uri[7:] if uri.startswith("file://") else uri
+                    try:
+                        with open(path, "rb") as fh:
+                            b64 = base64.b64encode(fh.read()).decode("ascii")
+                    except OSError as exc:
+                        self._log(f"[agentd] 读取图片失败 {uri}: {exc}")
+                        continue
+                if not b64:
+                    self._log("[agentd] 图片 block 无 data 且 uri 不可读，跳过")
+                    continue
+                image_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
             else:
                 self._log(f"[agentd] 忽略非文本 block: {type(block).__name__}")
-        joined = "".join(parts).strip()
-        if not joined:
-            raise ValueError("prompt 里没有任何文本内容")
-        return joined
+        text = "".join(text_parts).strip()
+        if not image_parts:
+            if not text:
+                raise ValueError("prompt 里没有任何文本内容")
+            return text
+        content: list[dict] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        content.extend(image_parts)
+        return content
 
 
 async def serve(kernel: AgentKernel | None = None) -> None:

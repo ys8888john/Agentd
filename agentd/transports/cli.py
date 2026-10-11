@@ -146,7 +146,7 @@ class CliRunner:
             print("可用模式：", ", ".join(self.runtime.modes()), "  当前：", self.runtime.mode_of(self.sid))
         elif name == "history":
             for m in await self.runtime.kernel.history(self.sid):
-                print(f"  [{m.role}] {m.content}")
+                print(f"  [{m.role}] {m.content_text()}")
         else:
             print(f"未知命令：:{name}（:help 看帮助）")
         return False

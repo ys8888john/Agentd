@@ -590,5 +590,8 @@ def build_kernel(settings: Settings | None = None) -> AgentKernel:
         # 预算必须**每轮重新问**：GUI 的 token 上限是按模型 profile 热写的，
         # 在这里读一个启动时的死值，会变成"切到 128k 的模型却还按 8k 的窗口压缩"。
         context_budget=lambda: current_settings().max_context_tokens,
+        # 视觉转译层（kernel/vision.py）：配置走同一套热加载优先级链 ——
+        # GUI 的 hotenv.json 写 AGENTD_VISION_* 即可热开关，.env 同理。
+        vision_config_fn=env_value,
     )
     return kernel
