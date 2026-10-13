@@ -2100,11 +2100,21 @@ _SPECS: tuple[NativeTool, ...] = (
 ALL_TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in _SPECS)
 
 # AGENTD_TOOLS 的取值 → 实际启用的工具集合
+# 只读档：这三个 kind 的动作不改外部状态（见 needs_approval），因此
+# 1) 任何审批策略下都不弹窗；2) Ask 模式下是唯一被允许的工具。
+# 定义成常量而不是在两处各写一遍字面量：needs_approval 用它决定"放不放行"，
+# AskMode 用它决定"给不给模型看"，两个判定必须永远一致。
+READ_ONLY_KINDS: tuple[str, ...] = ("read", "search", "fetch")
+
 TOOL_PROFILES: dict[str, tuple[str, ...]] = {
     "native": ALL_TOOL_NAMES,
     "all": ALL_TOOL_NAMES,
     "read_only": ("read_file", "list_dir", "glob", "grep"),
     "ro": ("read_file", "list_dir", "glob", "grep"),
+    # Ask 档 = 只读档 + 联网查询。刻意多给 web_search / web_fetch：
+    # "只问不改动"要能查资料，否则多数问答（"这个库的 API 怎么用"）直接废掉。
+    # 反过来说，会落盘的 generate_image 与写类工具一律不给。
+    "ask": ("read_file", "list_dir", "glob", "grep", "web_search", "web_fetch"),
     "off": (),
     "none": (),
 }
@@ -2133,7 +2143,7 @@ def needs_approval(*, requires: bool, kind: str, destructive: bool, policy: str)
         policy = "native"
     if policy == "none":
         return False
-    if kind in ("read", "search", "fetch"):
+    if kind in READ_ONLY_KINDS:
         return False
     if policy == "all":
         return True

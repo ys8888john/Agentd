@@ -163,16 +163,27 @@ async def test_gateway_mode_and_modes_endpoints(tmp_path) -> None:
     async with server:
         async with httpx.AsyncClient(base_url=base, timeout=10) as c:
             sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
-            assert (await c.get("/v1/modes")).json()["modes"] == ["agent", "plan", "single"]
+            # /v1/modes 是机器接口：列出内核注册的全部模式（含调试档 single）。
+            # 界面上显示哪几档由 routing.UI_MODES 决定（ACP 层按它裁剪），
+            # 这里不裁 —— HTTP API 应该如实反映内核能力。
+            assert (await c.get("/v1/modes")).json()["modes"] == [
+                "agent",
+                "ask",
+                "plan",
+                "single",
+            ]
             bad = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "nope"})
             assert bad.status_code == 400
             ok = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "single"})
             assert ok.status_code == 200
             assert gw.runtime.mode_of(sid) == "single"
-            # plan 也是合法模式（计划模式：先出计划，确认后逐步执行）
+            # plan / ask 也是合法模式（计划模式：先出计划，确认后逐步执行）
             ok2 = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "plan"})
             assert ok2.status_code == 200
             assert gw.runtime.mode_of(sid) == "plan"
+            ok3 = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "ask"})
+            assert ok3.status_code == 200
+            assert gw.runtime.mode_of(sid) == "ask"
 
 
 async def test_gateway_prompt_unknown_session_404(tmp_path) -> None:

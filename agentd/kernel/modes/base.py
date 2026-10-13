@@ -42,6 +42,18 @@ class ModeContext:
     approve: ApproveHandler | None = None
     # 审批策略：native（默认，只拦原生写/执行类）| all（非只读全拦）| none（全放行）
     approval_policy: str = "native"
+    # 只读档（Ask 模式）：True = 这一轮只许读/搜索/抓取，不许改文件、跑命令。
+    #
+    # 为什么需要它而不只靠工具箱 profile：profile 只管得住**原生**工具，
+    # MCP 工具是客户端在 session/new 里声明的、由外部 server 提供的，
+    # 内核没法按 profile 提前裁剪。于是把这个标记放在上下文里，
+    # AgentMode 在两处按它把关 —— 合并 schema 时不给模型看非只读工具，
+    # 派发执行时再拦一道（防模型幻觉出工具名硬调）。
+    #
+    # 与 approval_policy 的关系：审批是"动手前问一句"，只读档是"压根不许动手"。
+    # 所以只读拦截**不走审批通道** —— 弹窗再拒等于让模型白等一次往返，
+    # 还会诱导它换个工具重试。
+    read_only: bool = False
 
     # 取消信号（asyncio.Event），由传输层造：一次 prompt 一个，收到 session/cancel
     # 时被 set。内核与模式在循环边界上查询，尽快收尾；None = 本轮不可取消

@@ -32,7 +32,13 @@ from ..blobstore import externalize
 from ..llm import LLMNotice, LLMText, LLMThought, LLMToolCall
 from ..mcp import McpHub, ToolBinding
 from ..models import Message, ToolCall
-from ..tools import ERROR_PREFIX, ApprovalRequest, NativeTool, needs_approval
+from ..tools import (
+    ERROR_PREFIX,
+    READ_ONLY_KINDS,
+    ApprovalRequest,
+    NativeTool,
+    needs_approval,
+)
 from .base import Mode, ModeContext
 
 # 工具循环上限：防模型来回调不停（每次循环至少一次 LLM 调用）。
@@ -299,6 +305,11 @@ class AgentMode(Mode):
         顺序不是随意的：小模型看 tools 数组是有先后的（越靠前越容易被选中），
         而原生工具是高频基础动作，MCP 是专项能力。两者都空时返回 None ——
         这正是 "没有工具时与 single 等价" 的开关。
+
+        只读档（ctx.read_only，Ask 模式）时把非只读的 MCP 工具剔掉：MCP 工具
+        没有 profile 概念，只能从 annotations 反推 kind（见 _mcp_kind），
+        认不出只读的一律按非只读处理 —— 宁可少给一个工具，不能放过一个写操作。
+        原生侧不用在这里管：内核造工具箱时已经按 profile 收窄过了。
         """
         merged: list[dict] = []
         seen: set[str] = set()
@@ -308,8 +319,12 @@ class AgentMode(Mode):
                 merged.append(item)
                 seen.add(name)
         for item in hub.tool_schema():
-            if item["function"]["name"] not in seen:
-                merged.append(item)
+            name = item["function"]["name"]
+            if name in seen:
+                continue
+            if ctx.read_only and _mcp_kind(hub.binding(name)) not in READ_ONLY_KINDS:
+                continue
+            merged.append(item)
         return merged or None
 
     # ---- 单次工具调用 ----
@@ -340,6 +355,33 @@ class AgentMode(Mode):
         else:
             # 名字没对上任何来源：不执行，但要走完 start/done 让客户端把卡片收掉
             title, kind, requires, destructive = call.name, "other", False, False
+
+        # 只读档（Ask 模式）的第二道闸。schema 里已经剔掉了非只读工具，
+        # 这里防的是模型幻觉出一个工具名硬调（小模型常见），以及 MCP
+        # 服务端声明与实际行为不一致的情况。
+        # 刻意**不走审批**：弹窗再拒等于让模型白等一次往返，还会诱导它换个
+        # 工具重试；直接给一条明确的错误，它才知道该改成"只描述不执行"。
+        if ctx.read_only and kind not in READ_ONLY_KINDS:
+            output = (
+                f"{ERROR_PREFIX}Ask（只读）模式不允许执行 {title}。"
+                "本轮只能读取文件、搜索和抓取网页；需要改动请切回 Agent 模式。"
+            )
+            yield ToolCallStart(
+                session_id=ctx.session_id,
+                run_id=ctx.run_id,
+                call_id=call.id,
+                title=title,
+                kind=kind,  # type: ignore[arg-type]
+            )
+            yield ToolCallDone(
+                session_id=ctx.session_id,
+                run_id=ctx.run_id,
+                call_id=call.id,
+                status="cancelled",
+                output=output,
+            )
+            yield Message.tool(output, tool_call_id=call.id, name=call.name)
+            return
 
         yield ToolCallStart(
             session_id=ctx.session_id,

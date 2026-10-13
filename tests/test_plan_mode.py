@@ -34,7 +34,7 @@ from agentd.kernel.kernel import AgentKernel, UnknownModeError
 from agentd.kernel.llm import LLM, LLMText, LLMToolCall
 from agentd.kernel.models import Message
 from agentd.kernel.modes.plan import MAX_PLAN_ENTRIES, PlanMode, parse_plan
-from agentd.kernel.routing import looks_like_planning, route_mode
+from agentd.kernel.routing import UI_MODES, normalize_mode
 from agentd.kernel.store import InMemorySessionStore
 
 _PLAN_TEXT = "好的，我来拆分：\n1. 列出工作目录的文件\n2. 读取 config.json 确认端口\n3. 汇报结论"
@@ -112,7 +112,7 @@ def test_parse_plan_empty_when_no_markers():
 
 async def test_kernel_registers_plan_mode():
     kernel = _kernel([[LLMText("x")]])
-    assert kernel.modes() == ["agent", "plan", "single"]
+    assert kernel.modes() == ["agent", "ask", "plan", "single"]
     sid = await kernel.create_session()
     await kernel.validate(sid, "plan")  # 不抛即通过
     with pytest.raises(UnknownModeError):
@@ -322,105 +322,49 @@ def test_plan_update_event_adapter_roundtrip():
     assert back.entries[1].status == "completed"
 
 
-# ---- 模式自动路由：规划类请求 agent → plan ----
+# ---- 模式解析：只归一化，不猜意图 ----
 
 
-def test_looks_like_planning_matches_common_phrasings():
-    # 执行向的规划请求：要"把一件事分步做出来"
-    for text in (
-        "把这个需求拆解一下",
-        "帮我分解成可执行的步骤",
-        "策划一场发布会",
-        "帮我把这个仓库的重构规划一下",
-        "plan out the migration",
-    ):
-        assert looks_like_planning(text), f"漏判：{text}"
+def test_normalize_mode_falls_back_to_default():
+    assert normalize_mode(None) == "agent"
+    assert normalize_mode("") == "agent"
+    assert normalize_mode("   ") == "agent"
+    # 客户端 / 配置文件里出现过的别名
+    assert normalize_mode("auto") == "agent"
+    assert normalize_mode("DEFAULT") == "agent"
+    assert normalize_mode("chat") == "agent"
+    assert normalize_mode("ask") == "ask"
+    assert normalize_mode("read_only") == "ask"
+    assert normalize_mode("planning") == "plan"
+    assert normalize_mode("once") == "single"
 
 
-def test_looks_like_planning_rejects_ordinary_requests():
-    for text in ("你好", "读一下 config.json", "帮我写个爬虫", "搜索今天的新闻", ""):
-        assert not looks_like_planning(text), f"误判：{text}"
-    # roadmap 是裸名词（"看看 roadmap.md" 是读文件不是规划）—— 曾经把它收进
-    # 词表，把 test_additional_roots 的 agent 用例绊翻过（2026-10-13）。
-    assert not looks_like_planning("看看 roadmap")
-    assert not looks_like_planning("roadmap.md 里写了什么")
+def test_normalize_mode_trims_and_lowercases():
+    assert normalize_mode(" Ask ") == "ask"
+    assert normalize_mode("PLAN") == "plan"
 
 
-def test_looks_like_planning_exempts_consultation_topics():
-    """咨询类话题：要的是完整答复，不是分步执行 —— 一律不提升（2026-10-13 用户实测）。
+def test_normalize_mode_passes_unknown_through():
+    """认不出来的原样返回，交给内核 _get_mode 抛 UnknownModeError。
 
-    "帮我规划一个7天的新疆旅行"曾被提升进 plan：一次计划审批 + 7 轮逐步执行，
-    一个回答被拆碎，历史里还留 7 条内部步骤消息。原话："这个问题不应该识别为
-    一个 plan 任务"。
+    静默回退成 agent 会让「客户端选了个不存在的模式」这类错误消失得无声无息。
     """
-    for text in (
-        "帮我规划一个7天的新疆旅行",
-        "帮我规划一个7天的新疆旅行，要有每日行程",
-        "安排一下周末的行程",
-        "去西藏的攻略",
-        "制定一个学习计划",
-        "云南旅游路线推荐",
-        "推荐一个减脂食谱",
-        "plan my itinerary for Japan",
-        "give me a 7-day travel plan for Japan",
-    ):
-        assert not looks_like_planning(text), f"咨询请求被误判为规划：{text}"
+    assert normalize_mode("nope") == "nope"
 
 
-def test_looks_like_planning_reads_multimodal_input():
-    blocks = [
-        {"type": "text", "text": "帮我规划"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
-    ]
-    assert looks_like_planning(blocks)
+def test_ui_modes_exposes_exactly_three():
+    """界面上就是三档：single 是调试档位，不给用户。"""
+    assert UI_MODES == ("agent", "plan", "ask")
+    assert "single" not in UI_MODES
 
 
-def test_route_mode_only_upgrades_from_default_agent():
-    # 默认 agent + 执行向规划意图 → plan
-    assert route_mode("把这个需求拆解一下", "agent") == "plan"
-    # 默认 agent + 普通请求 → 原样
-    assert route_mode("你好", "agent") == "agent"
-    # 默认 agent + 咨询类请求 → 原样（要完整答复，不是计划流程）
-    assert route_mode("帮我规划旅行", "agent") == "agent"
-    # 用户显式选过 single / plan：不插手（明确意图优先于启发式）
-    assert route_mode("把这个需求拆解一下", "single") == "single"
-    assert route_mode("你好", "plan") == "plan"
+async def test_agent_mode_never_rewrites_a_planning_request():
+    """回归（2026-10-13 用户实测）：没有关键词自动路由。
 
-
-def test_route_mode_kill_switch(monkeypatch):
-    monkeypatch.setenv("AGENTD_PLAN_AUTOROUTE", "0")
-    assert route_mode("把这个需求拆解一下", "agent") == "agent"
-    monkeypatch.delenv("AGENTD_PLAN_AUTOROUTE", raising=False)
-    assert route_mode("把这个需求拆解一下", "agent") == "plan"
-
-
-async def test_agent_mode_auto_routes_planning_request():
-    """集成：agent 模式发执行向规划请求 → 自动走 plan（出计划 + 透明提示）。"""
-    script = [
-        [LLMText("1. 查目的地资料\n2. 汇总成行程")],   # 规划调用
-        [LLMText("资料已查完")],                        # 步骤 1
-        [LLMText("行程已汇总")],                        # 步骤 2
-    ]
-    kernel = _kernel(script)
-    sid = await kernel.create_session()
-
-    events = [
-        e
-        async for e in kernel.handle(sid, "把这个需求拆解一下", mode="agent", approve=_yes)
-    ]
-
-    assert _plan_updates(events), "规划类请求没有自动走 plan 流程"
-    assert _plan_updates(events)[-1][-1][1] == "completed"
-    # 透明提示：模式被换掉必须让用户看见
-    assert any(isinstance(e, Notice) and "自动按计划模式" in e.text for e in events)
-
-
-async def test_agent_mode_consultation_request_stays_agent():
-    """回归（2026-10-13 用户实测）：旅行咨询请求留在 agent 模式直接作答。
-
-    "帮我规划一个7天的新疆旅行"曾被自动路由进 plan：一次计划审批 + 7 轮逐步
-    执行，一个完整答复被拆成 7 段。现在必须原样走 agent：不出计划、不弹审批、
-    一轮给出完整答复。
+    "帮我规划一个7天的新疆旅行"曾经会被提升进 plan：一次计划审批 + 7 轮逐步执行，
+    一个完整答复被拆成 7 段，历史里还留下 7 条"【计划 i/7】…"内部消息。
+    用户原话："这个问题不应该识别为一个 plan 任务"。中间加过咨询类话题豁免止血，
+    但豁免名单是打地鼠 —— 索性连自动路由一起去掉：想分步执行就自己点 Plan。
     """
     script = [[LLMText("D1 乌鲁木齐…D7 返回，完整行程如下")]]
     kernel = _kernel(script)
@@ -428,10 +372,12 @@ async def test_agent_mode_consultation_request_stays_agent():
 
     events = [
         e
-        async for e in kernel.handle(sid, "帮我规划一个7天的新疆旅行", mode="agent", approve=_yes)
+        async for e in kernel.handle(
+            sid, "帮我规划一个7天的新疆旅行", mode="agent", approve=_yes
+        )
     ]
 
-    assert _plan_updates(events) == [], "咨询请求不该走 plan 流程"
+    assert _plan_updates(events) == [], "agent 模式被自动改写成了 plan"
     assert not any(isinstance(e, Notice) and "自动按计划模式" in e.text for e in events)
     dones = [e for e in events if isinstance(e, MessageDone)]
     assert len(dones) == 1 and "完整行程" in dones[0].text
@@ -441,21 +387,8 @@ async def test_agent_mode_consultation_request_stays_agent():
     assert kernel.llm.calls == 1  # type: ignore[attr-defined]
 
 
-async def test_agent_mode_ordinary_request_stays_agent():
-    """回归：普通请求在 agent 模式下的行为不变（不出计划、不弹审批）。"""
-    script = [[LLMText("你好，有什么可以帮你？")]]
-    kernel = _kernel(script)
-    sid = await kernel.create_session()
-
-    events = [e async for e in kernel.handle(sid, "你好", mode="agent", approve=_yes)]
-
-    assert _plan_updates(events) == []
-    assert not any(isinstance(e, Notice) and "自动按计划模式" in e.text for e in events)
-    assert any(isinstance(e, MessageDone) for e in events)
-
-
-async def test_autoroute_respects_kill_switch(monkeypatch):
-    monkeypatch.setenv("AGENTD_PLAN_AUTOROUTE", "0")
+async def test_plan_mode_requires_explicit_selection():
+    """回归：停在 agent 档时，执行向的规划请求也**不会**自动走 plan。"""
     script = [[LLMText("直接回答，不规划")]]
     kernel = _kernel(script)
     sid = await kernel.create_session()
@@ -465,5 +398,6 @@ async def test_autoroute_respects_kill_switch(monkeypatch):
         async for e in kernel.handle(sid, "把这个需求拆解一下", mode="agent", approve=_yes)
     ]
 
-    assert _plan_updates(events) == []
+    assert _plan_updates(events) == [], "agent 模式不该自动出计划"
     assert not any(isinstance(e, Notice) and "自动按计划模式" in e.text for e in events)
+    assert any(isinstance(e, MessageDone) for e in events)

@@ -37,8 +37,8 @@ from .context import (
 )
 from .memory import MemoryFile, compact, render_memory_block
 from .models import Message, ToolRecord
-from .modes import AgentMode, Mode, ModeContext, PlanMode, SingleMode
-from .routing import route_mode
+from .modes import AgentMode, AskMode, Mode, ModeContext, PlanMode, SingleMode
+from .routing import normalize_mode
 from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
@@ -102,22 +102,45 @@ class AgentKernel:
         self.register(SingleMode())
         self.register(AgentMode())
         self.register(PlanMode())
+        self.register(AskMode())
+
+    def tool_profile_for(self, mode: str) -> str:
+        """这一轮实际要用的原生工具档位（``tools.TOOL_PROFILES`` 的键）。
+
+        只有 Ask 档会脱离会话级配置：它是"只读不动手"的承诺，即使会话层面
+        开着全部原生工具，这一轮也只给读/搜索/抓取。其余模式一律沿用
+        ``AGENTD_TOOLS``，避免模式悄悄改写用户显式配过的东西。
+        """
+        return "ask" if normalize_mode(mode) == "ask" else self.native_tools
 
     def _make_toolbox(
-        self, cwd: str | None, additional_roots: list[Any] | None = None
+        self,
+        cwd: str | None,
+        additional_roots: list[Any] | None = None,
+        *,
+        profile: str | None = None,
     ) -> NativeToolbox | None:
         """按会话 cwd 造一个原生工具箱；profile=off 或构造失败都返回 None。
 
         每个 run 造一个（而不是内核级共享）：cwd 是会话级的，
         而且构造只是建个字典，成本可以忽略。
+
+        `profile` 显式给出时覆盖会话级的 ``AGENTD_TOOLS``（只有 Ask 档会这么干），
+        None = 沿用会话配置。取值见 tools.TOOL_PROFILES。
         """
-        if self.native_tools not in TOOL_PROFILES:
+        if profile is None:
+            profile = self.native_tools
+        # 非法档位（AGENTD_TOOLS 拼错，或调用方传了不存在的名字）一律降级为
+        # native 并在 stderr 留一句 —— 拼错配置不该悄悄变成"没有工具"。
+        # 降级规则只写这一处：显式传入的档位与来自环境变量的档位走同一条路，
+        # 于是 tool_profile_for 只需负责"选哪个"，不必重复判断合法性。
+        if profile not in TOOL_PROFILES:
             print(
-                f"[agentd] 未知 AGENTD_TOOLS 取值 {self.native_tools!r}，按 native 处理",
+                f"[agentd] 未知工具档位 {profile!r}，按 native 处理",
                 file=sys.stderr,
                 flush=True,
             )
-        profile = self.native_tools if self.native_tools in TOOL_PROFILES else "native"
+            profile = "native"
         if not TOOL_PROFILES[profile]:
             return None
         try:
@@ -156,7 +179,9 @@ class AgentKernel:
             roots.append(blob_root)
         return roots
 
-    def _system_prompt(self, opts: dict[str, Any], memory: str = "") -> str | None:
+    def _system_prompt(
+        self, opts: dict[str, Any], memory: str = "", profile: str | None = None
+    ) -> str | None:
         """本轮真正要用的 system prompt = 用户写的 + 运行时说明。
 
         运行时说明目前有三类 source（将来的还可以继续往 sections 里加）：
@@ -175,23 +200,32 @@ class AgentKernel:
         memory 由调用方传进来而不是从 opts 里取 —— opts 是**会话级配置**
         （create_session 写一次），把每轮都变的记忆文本塞进去，等于让读取
         者分不清"这是配置还是临时产物"。
+
+        profile 是本轮真正生效的工具档位（Ask 档会覆盖会话配置）；不传就按
+        会话级的 native_tools 判断。
         """
+        # 用**本轮生效的档位**而不是会话级 native_tools 来判断：Ask 档下工具箱
+        # 已被收窄成"只读四件套 + 联网两件套"，若仍按 native 判断，系统提示词
+        # 里照样会给出工作目录清单与技能索引，而模型手上并没有写工具、也没有
+        # load_skill —— 给了索引却加载不了，只会诱导它空转。
+        tools = TOOL_PROFILES.get(profile or self.native_tools, ())
+
         # 行为规范恒在、且排在最前（紧跟用户 system prompt 之后）：它是"怎么说话
         # 怎么交付"的硬约束，比工作目录、记忆这些"背景资料"优先级更高 —— 排在
         # 前面模型更不容易在长上下文里把它冲淡。
         sections: list[str] = [BEHAVIOR_GUIDE, memory]
-        if self.native_tools in TOOL_PROFILES and TOOL_PROFILES[self.native_tools]:
+        if tools:
             cwd = opts.get("cwd")
             if cwd:
                 try:
                     sections.append(workspace_brief(Path(cwd)))
                 except OSError:
                     pass  # 目录被删了 / 没权限读：环境说明掉了不该整轮失败
-            # 技能索引：只在 load_skill 真被启用时注入（read_only/off 档没有
+            # 技能索引：只在 load_skill 真被启用时注入（read_only/ask/off 档没有
             # 这个工具，给了索引模型也加载不了，反而诱导它空转）。
             # 发现器自己吞掉所有 IO/格式错误 —— 索引失败顶多这轮没有技能可用，
             # 不值得为它加 try 层。
-            if "load_skill" in TOOL_PROFILES[self.native_tools]:
+            if "load_skill" in tools:
                 sections.append(index_section(cwd or None))
         return compose_system(self.system, sections)
 
@@ -471,19 +505,12 @@ class AgentKernel:
         async with lock:
             run_id = new_run_id()
 
-            # 规划类请求自动走计划流程（默认 agent 模式 + 请求命中规划意图；
-            # 显式选过 single/plan 的不插手，AGENTD_PLAN_AUTOROUTE=0 全关）。
-            # 放在锁内、run_id 之后：提示Notice要带 run_id，而路由只读请求内容，
-            # 没有并发依赖。透明提示是刻意的 —— 模式被换掉必须让用户看见。
-            routed = route_mode(user_input, mode)
-            if routed != mode:
-                mode = routed
-                yield Notice(
-                    session_id=session_id,
-                    run_id=run_id,
-                    text="检测到规划类请求，本轮自动按计划模式执行。",
-                )
-
+            # 模式由调用方说了算 —— 界面上就是用户显式选的那一档，内核不做
+            # "看请求文本猜模式"的事（猜错的代价是整轮行为跑偏，而猜对只省一次
+            # 点击，见 kernel/routing.py 的模块注释）。这里只把传进来的标识
+            # 归一化（None / 空串 / 别名 / 大小写），认不出来的原样交给
+            # _get_mode 抛 UnknownModeError —— 报错比静默跑一轮好。
+            mode = normalize_mode(mode)
             impl = self._get_mode(mode)
 
             # 用户消息先落库，这样传给模式的 history 里已经包含本轮输入
@@ -512,16 +539,21 @@ class AgentKernel:
             memory = await self._recall(session_id, own=own_summary)
 
             opts = self._session_opts.get(session_id, {})
+            # Ask 档把原生工具收窄成只读（见 tool_profile_for）；其余模式沿用
+            # 会话级 AGENTD_TOOLS。系统提示词要按同一个档位算，否则会出现
+            # "提示词说能读写、工具箱里只有读"的错位。
+            profile = self.tool_profile_for(mode)
             toolbox = self._make_toolbox(
                 opts.get("cwd"),
                 self._tool_roots(opts.get("additional_directories")),
+                profile=profile,
             )
             # 工具 schema 也占窗口（放着二十几个 MCP 工具的 schema 不是小数），
             # 所以触发线要把它算进去。MCP 的工具要连上 server 才知道有哪些，
             # 而连接是每轮开一次的重量级动作 —— 这里只估原生工具，
             # 缺口由发请求前的硬裁剪（LiveLLM._trim）兜底，那道是必经之路。
             tools_schema = toolbox.tool_schema() if toolbox is not None else []
-            system = self._system_prompt(opts, memory)
+            system = self._system_prompt(opts, memory, profile=profile)
 
             notice = ""
             plan = plan_compaction(
@@ -550,7 +582,7 @@ class AgentKernel:
                     own_summary, _ = await self._compaction_of(session_id)
                     # 记忆要重读：刚才压出来的摘要此刻才对得上窗口移走的那一段
                     memory = await self._recall(session_id, own=own_summary)
-                    system = self._system_prompt(opts, memory)
+                    system = self._system_prompt(opts, memory, profile=profile)
 
             # ---- 视觉转译层：主模型不支持视觉时，图片块在这里被换成文字转述 ----
             # 必须放在**窗口切完、压缩补切之后**：两条切窗路径汇合到这里，

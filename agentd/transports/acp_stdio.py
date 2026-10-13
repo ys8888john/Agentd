@@ -44,6 +44,7 @@ from ..contracts import (
     ToolCallStart,
 )
 from ..kernel.kernel import AgentKernel
+from ..kernel.routing import UI_MODES, normalize_mode
 from ..kernel.tools import ApprovalRequest, ApproveHandler
 
 # ACP 的 stop_reason 取值是固定的五种，其中没有 "error"：
@@ -93,9 +94,12 @@ _ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session"})
 # 会话模式给客户端看的名字。id 与内核 Mode.name 严格一致（set_session_mode
 # 收到的就是它），name/description 是给人看的。
 _MODE_LABELS = {
+    "agent": ("Agent", "直接动手：读文件、搜索、改代码、跑命令，直到把事情做完。"),
+    "plan": ("Plan", "先列出分步计划，确认后逐步执行，步骤进度实时可见。"),
+    "ask": ("Ask", "只回答不动手：能读文件、搜索、抓网页，但不会改动任何东西。"),
+    # 不在 UI_MODES 里 → 界面上不出现。留着是因为 CLI `--mode single` 与
+    # 老客户端仍在用，set_session_mode 收到它照样要认。
     "single": ("单次对话", "调一次 LLM 就结束，不调工具。"),
-    "agent": ("Agent（默认）", "工具循环：LLM ↔ 工具，直到给出纯文本。"),
-    "plan": ("计划", "先列出分步计划，确认后逐步执行，步骤进度实时可见。"),
 }
 
 
@@ -175,10 +179,16 @@ class AgentdAcpAgent(Agent):
 
     def _modes_state(self, session_id: str | None = None) -> SessionModeState:
         """当前模式状态的完整描述（new_session / load_session 复用）。"""
-        current = self._session_modes.get(session_id or "", "agent")
+        current = normalize_mode(self._session_modes.get(session_id or "", "agent"))
         modes = self._kernel.modes()
         available = []
-        for name in modes:
+        # 按 UI_MODES 的顺序遍历（而不是内核的排序结果）—— 界面上三档的
+        # 排列顺序由这份清单决定，不该被 sorted() 的字母序左右。
+        # 内核里有但清单外的模式（single）**刻意不声明**：那是底层调试档位，
+        # 界面上不给，但 set_session_mode 收到照样认（见 _MODE_LABELS 的注释）。
+        for name in UI_MODES:
+            if name not in modes:
+                continue
             label, desc = _MODE_LABELS.get(name, (name, ""))
             available.append(SessionMode(id=name, name=label, description=desc))
         # current 不在可用列表里（异常状态）时回退 agent，别声明不存在的 current
