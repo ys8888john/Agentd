@@ -163,12 +163,16 @@ async def test_gateway_mode_and_modes_endpoints(tmp_path) -> None:
     async with server:
         async with httpx.AsyncClient(base_url=base, timeout=10) as c:
             sid = (await c.post("/v1/sessions", json={})).json()["session_id"]
-            assert (await c.get("/v1/modes")).json()["modes"] == ["agent", "single"]
+            assert (await c.get("/v1/modes")).json()["modes"] == ["agent", "plan", "single"]
             bad = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "nope"})
             assert bad.status_code == 400
             ok = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "single"})
             assert ok.status_code == 200
             assert gw.runtime.mode_of(sid) == "single"
+            # plan 也是合法模式（计划模式：先出计划，确认后逐步执行）
+            ok2 = await c.post(f"/v1/sessions/{sid}/mode", json={"mode_id": "plan"})
+            assert ok2.status_code == 200
+            assert gw.runtime.mode_of(sid) == "plan"
 
 
 async def test_gateway_prompt_unknown_session_404(tmp_path) -> None:

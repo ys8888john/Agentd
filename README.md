@@ -240,18 +240,65 @@ provider 在**下一轮对话**即生效，不用重启进程。
 - **清空要写空串，不能删键。** ForgeAgent-GUI 的 `save_models` 是"缺的键沿用旧值"
   的合并语义（为了保住被打码的 API key），所以删键等于没删，必须显式写 `""`。
 
-## 模式：single / agent
+## 模式：single / agent / plan
 
 | 模式 | 行为 |
 |---|---|
 | `single` | 调一次 LLM 就结束。无工具的老行为。 |
-| `agent` | **默认**。工具循环：LLM → 若要调工具就执行 → 结果回灌 → 再调 LLM → 直到出纯文本（上限 12 步）。没有可用工具时与 `single` 等价。 |
+| `agent` | **默认**。工具循环：LLM → 若要调工具就执行 → 结果回灌 → 再调 LLM → 直到出纯文本（上限 16 步）。没有可用工具时与 `single` 等价。 |
+| `plan` | 先出计划，确认后逐步执行（见下）。 |
 
 这组模式已通过 ACP 的 session modes 对客户端声明（`session/new` 和
 `session/load` 的响应里带 `modes.currentModeId / availableModes`），
-`session/set_mode` 收到的 id 就是这里的 `single` / `agent`。
+`session/set_mode` 收到的 id 就是这里的 `single` / `agent` / `plan`。
 切换成功后 agentd 会广播标准的 `current_mode_update` 通知 —— 所有在看这个
 会话的客户端同步到新模式，不依赖各自的轮询。
+
+### plan（计划）模式
+
+一轮分四段（`kernel/modes/plan.py`）：
+
+1. **规划**：一次**不带工具**的 LLM 调用，模型按钉死的格式（`序号. 步骤内容`）
+   输出编号计划。解析不出就退化成单步（语义等同 agent 模式）并发 Notice；
+   超过 8 步截断并告知。计划原文以 assistant 消息落库（续聊时模型看得到
+   "我计划过什么"），但**不外发** —— 界面上计划由计划卡渲染，不重复一份原文。
+2. **计划通知**：`PlanUpdate` 事件（全量快照）→ ACP 原生的 `update_plan`
+   通知（`PlanEntry{content, priority, status}`，status ∈ pending/in_progress/
+   completed）。协议层就有这个概念，不另造轮子。
+3. **审批门**：复用工具审批那条通道（`ApprovalRequest(tool="plan")` →
+   `session/request_permission`）—— 不新增协议面，现有客户端直接能用。
+   拒绝 = 礼貌收尾（Notice + "（计划未执行）"），不进工具循环；
+   `AGENTD_TOOLS_APPROVE=none`（无人值守）时不问，直接执行。
+4. **逐步执行**：每条 = 一轮**完整的 AgentMode 运行**（工具 / 审批 / 中断 /
+   落库全沿用，不重写一遍循环）。条目状态真实翻转：开跑前置 `in_progress`、
+   跑完置 `completed` —— 界面上的 ✓ 背后是真干完了，不是计时器。
+
+两个实现要点：
+
+- **快照必须发新对象。** 模式内部持续改条目状态，直接 yield 同一个列表会把
+  内部状态泄露给事件流 —— 事后再看早先的快照（测试、调试口）会看到被污染的
+  终态。`_snapshot()` 每次新建（2026-10-13 实测踩到，有回归测试）。
+- **步骤间要自己穿历史。** 内核只负责落库，不管模式的内存列表；每步的用户
+  消息和工具往返要同时 `yield`（落库）和 `append` 进 `ctx.history`（让后续
+  步骤的 LLM 立刻看得到），否则第 2 步不知道第 1 步干过什么。
+
+### 自动路由：规划类请求自动走 plan
+
+停在默认 `agent` 模式时，请求文本命中规划意图（`kernel/routing.py` 的词表：
+规划 / 计划 / 安排 / 策划 / 拆解 / 分解 / 行程 / 攻略，英文只收 `plan out` /
+`make a plan` / `itinerary` 这类动词性短语）就**本轮**自动按 plan 执行，
+并发一条 `[提示]` 告知用户（模式被换掉必须可见）。规则刻意保守：
+
+- **只提升不覆盖**：用户显式选过 `single` / `plan` 的不插手；
+- **会话的存储模式不变**：下拉框仍显示 agent，下一轮普通请求照常走 agent ——
+  自动路由是"这一轮"的，不会把会话黏在计划流程里（追问"第二天详细点"不会
+  又被拖去审批）；
+- **裸名词不进词表**：`roadmap` 作为常见文件名（"看看 roadmap.md" 是读文件）
+  会把普通请求误拖进计划审批，2026-10-13 实测绊翻过测试，已剔除；
+- 误命中的代价是一次可拒绝的审批框，漏命中等于功能不存在 —— 词表往宽收。
+
+总开关 `AGENTD_PLAN_AUTOROUTE=0`（调用时读，改完下一句生效，不用重启）。
+三个入口（ACP / Gateway / CLI）共用这一份规则（挂在内核 `handle()` 入口）。
 
 ### 停止（中断）正在跑的一轮
 
@@ -718,6 +765,13 @@ pytest -q
 工具批次之间收到停止信号的行为（工具不执行、正文留"已流出的部分"、
 `cancelled` 收尾、历史照常落库），以及传输层 `cancel()` 与 `prompt()` 并发的
 往返（带节奏钩子的假 LLM 确定性触发，不起子进程）。
+
+plan（计划）模式的测试在 `tests/test_plan_mode.py`（13 个用例）：计划解析纯函数
+（标记/强调/上限/空）、内核注册、主流程（全 pending → 逐步 in_progress →
+completed 的快照序列，**快照不互相污染**）、审批通过/拒绝/`approve=none` 不问、
+解析失败退化成单步、超 8 步截断、第 1 步前叫停、步骤里真调工具（AgentMode 循环
+完整复用 + 工具记录落库），以及 `PlanUpdate` 的 SSE 序列化回解析。
+模式声明列表的变化同步钉在 `test_session_load_and_diff.py` 与 `test_gateway.py`。
 
 `tests/test_session_load_and_diff.py` 锁 session/load 与 diff 输出：new/load
 声明的模式状态、load 后相对路径工具命中恢复的 cwd、不存在会话报错，

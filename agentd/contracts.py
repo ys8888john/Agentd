@@ -98,6 +98,30 @@ class ErrorEvent(EventBase):
     message: str
 
 
+class PlanEntryData(BaseModel):
+    """计划里的一个步骤（Plan 模式用）。
+
+    字段与 ACP 的 ``PlanEntry`` 一一对应（content / priority / status），
+    传输层原样翻译成 ``update_plan`` 通知 —— 协议层就有这个概念，不另造。
+    """
+
+    content: str
+    priority: Literal["high", "medium", "low"] = "medium"
+    status: Literal["pending", "in_progress", "completed"] = "pending"
+
+
+class PlanUpdate(EventBase):
+    """计划（全量快照）变了 —— 建计划、某步骤开始 / 完成时各发一次。
+
+    刻意发**全量**而不是增量：客户端（GUI）拿到直接替换 ``Turn.plan`` 即可，
+    不用自己合并增量状态；一次计划的条目数有上限（见 modes/plan.py），
+    全量的代价可以忽略。
+    """
+
+    type: Literal["plan_update"] = "plan_update"
+    entries: list[PlanEntryData] = Field(default_factory=list)
+
+
 class Done(EventBase):
     """本次执行结束，流的最后一个事件。"""
 
@@ -115,6 +139,7 @@ Event: TypeAlias = Annotated[
         ToolCallStart,
         ToolCallDone,
         ErrorEvent,
+        PlanUpdate,
         Done,
     ],
     Field(discriminator="type"),

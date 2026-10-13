@@ -66,10 +66,25 @@ def test_model_dump_openai_shape():
         "tool_calls": None,
         "tool_call_id": None,
         "tool_record": None,
+        "internal": None,
     }
     # 发给 OpenAI 兼容端点时走 exclude_none=True（llm._with_system），
     # None 字段不会出现在线格式里 —— 上面精确对比包含 None 键只是模型事实。
     assert "tool_record" not in m.model_dump(exclude_none=True)
+    # internal（内部消息标记，plan 模式用）同样不上线格式：它只服务
+    # 落库 payload 与客户端历史回放过滤（跨仓库契约，见 Message.internal）
+    assert "internal" not in m.model_dump(exclude_none=True)
+
+
+def test_internal_flag_roundtrips_and_defaults_none():
+    """internal 默认 None（旧数据/普通消息），置 True 后序列化往返不丢。"""
+    plain = Message(role="user", content="hi")
+    assert plain.internal is None
+
+    marked = Message(role="assistant", content="我的计划：", internal=True)
+    assert marked.internal is True
+    back = Message.model_validate_json(marked.model_dump_json())
+    assert back.internal is True
 
 
 # 工具调用字段（tool_calls / tool_call_id）

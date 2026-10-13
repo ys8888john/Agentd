@@ -70,6 +70,16 @@ class Message(BaseModel):
     # 与 role="tool" 的分野见 ToolRecord 的 docstring。
     tool_record: ToolRecord | None = None
 
+    # 内部消息标记（plan 模式用）：True = 这条消息是模式内部的指令/记录，
+    # 要进模型上下文、要落库，但**不是给人看的** —— 客户端历史回放必须跳过。
+    # 不打的后果（2026-10-13 实测）：plan 跑完一轮，历史里混进 1 条"我的计划：…"
+    # 和 N 条"【计划 i/N】…只完成这一步…"，GUI 回放时全画成普通气泡，侧栏预览
+    # 也变成步骤提示词 —— 用户原话"界面很乱"。
+    # 默认 None（假）：model_dump(exclude_none=True) 时不出现，旧库数据兼容。
+    # ⚠️ 跨仓库契约：GUI 的 sessions.get_history 按 payload.internal 过滤，
+    #    两边对不上时最坏退化为"多画一个气泡"，不会崩。
+    internal: bool | None = None
+
     @classmethod
     def user(cls, content: str | list[dict]) -> "Message":
         return cls(role="user", content=content)

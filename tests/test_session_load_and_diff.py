@@ -50,11 +50,13 @@ async def test_new_session_declares_available_modes(tmp_path) -> None:
     assert resp.session_id.startswith("sess_")
     modes = resp.modes
     assert modes is not None
-    assert [m.id for m in modes.available_modes] == ["agent", "single"]
+    assert [m.id for m in modes.available_modes] == ["agent", "plan", "single"]
     assert modes.current_mode_id == "agent"
     # 只声明存在的模式，且带人话描述
     by_id = {m.id: m for m in modes.available_modes}
     assert by_id["agent"].name and by_id["single"].description
+    # plan 模式也要有人话描述（客户端下拉框直接用它）
+    assert by_id["plan"].name and by_id["plan"].description
 
 
 async def test_load_session_rebinds_cwd_for_tools(tmp_path) -> None:

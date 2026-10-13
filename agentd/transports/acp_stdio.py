@@ -30,7 +30,7 @@ from acp import (
 )
 # PermissionOption / ToolCallUpdate 没在 acp 顶层导出，只能从 schema 取
 from acp.schema import PermissionOption, SessionMode, SessionModeState, ToolCallUpdate
-from acp.helpers import update_current_mode
+from acp.helpers import plan_entry, update_current_mode, update_plan
 
 from ..contracts import (
     Done,
@@ -38,6 +38,7 @@ from ..contracts import (
     MessageDelta,
     MessageDone,
     Notice,
+    PlanUpdate,
     ThoughtDelta,
     ToolCallDone,
     ToolCallStart,
@@ -94,6 +95,7 @@ _ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session"})
 _MODE_LABELS = {
     "single": ("单次对话", "调一次 LLM 就结束，不调工具。"),
     "agent": ("Agent（默认）", "工具循环：LLM ↔ 工具，直到给出纯文本。"),
+    "plan": ("计划", "先列出分步计划，确认后逐步执行，步骤进度实时可见。"),
 }
 
 
@@ -364,6 +366,23 @@ class AgentdAcpAgent(Agent):
                             event.call_id,
                             status=_ACP_STATUS.get(event.status, "completed"),
                             raw_output=event.output,
+                        ),
+                    )
+
+                elif isinstance(event, PlanUpdate):
+                    # ACP 原生就有计划概念（PlanEntry + session/update 的 plan
+                    # 通知），全量快照原样翻译，客户端直接替换整个计划。
+                    await self._conn.session_update(
+                        session_id,
+                        update_plan(
+                            [
+                                plan_entry(
+                                    content=e.content,
+                                    priority=e.priority,
+                                    status=e.status,
+                                )
+                                for e in event.entries
+                            ]
                         ),
                     )
 

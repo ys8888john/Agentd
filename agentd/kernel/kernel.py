@@ -37,7 +37,8 @@ from .context import (
 )
 from .memory import MemoryFile, compact, render_memory_block
 from .models import Message, ToolRecord
-from .modes import AgentMode, Mode, ModeContext, SingleMode
+from .modes import AgentMode, Mode, ModeContext, PlanMode, SingleMode
+from .routing import route_mode
 from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
 from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
@@ -100,6 +101,7 @@ class AgentKernel:
         )
         self.register(SingleMode())
         self.register(AgentMode())
+        self.register(PlanMode())
 
     def _make_toolbox(
         self, cwd: str | None, additional_roots: list[Any] | None = None
@@ -464,11 +466,25 @@ class AgentKernel:
 
         if not await self.store.exists(session_id):
             raise UnknownSessionError(session_id)
-        impl = self._get_mode(mode)
 
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             run_id = new_run_id()
+
+            # 规划类请求自动走计划流程（默认 agent 模式 + 请求命中规划意图；
+            # 显式选过 single/plan 的不插手，AGENTD_PLAN_AUTOROUTE=0 全关）。
+            # 放在锁内、run_id 之后：提示Notice要带 run_id，而路由只读请求内容，
+            # 没有并发依赖。透明提示是刻意的 —— 模式被换掉必须让用户看见。
+            routed = route_mode(user_input, mode)
+            if routed != mode:
+                mode = routed
+                yield Notice(
+                    session_id=session_id,
+                    run_id=run_id,
+                    text="检测到规划类请求，本轮自动按计划模式执行。",
+                )
+
+            impl = self._get_mode(mode)
 
             # 用户消息先落库，这样传给模式的 history 里已经包含本轮输入
             await self.store.append(session_id, Message.user(user_input))
