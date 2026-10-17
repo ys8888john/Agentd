@@ -1273,6 +1273,67 @@ def test_kernel_set_approval_policy_rejects_unknown():
         kernel.set_approval_policy("typo")
 
 
+# ---- ext_method("approval")：GUI 状态下拉的查询 / 切换通道 ----
+
+
+async def test_ext_method_approval_get_returns_current_policy(tmp_path):
+    """不带 policy = 查询：原样返回内核当前策略，不动任何状态。"""
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    agent, kernel = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+    assert kernel.approval_policy == "native"
+    assert await agent.ext_method("approval", {}) == {"policy": "native"}
+    kernel.set_approval_policy("all")
+    assert await agent.ext_method("approval", {"policy": ""}) == {"policy": "all"}
+
+
+async def test_ext_method_approval_set_none_writes_marker(tmp_path, monkeypatch):
+    """set none = 弹窗里点「完全信任」的同一条状态迁移：热翻 + 落盘。"""
+    from agentd import trust
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    marker = tmp_path / "trust_all.json"
+    monkeypatch.setattr(trust, "trust_file", lambda: marker)
+    agent, kernel = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+
+    assert await agent.ext_method("approval", {"policy": "none"}) == {"policy": "none"}
+    assert kernel.approval_policy == "none"
+    assert marker.is_file() and trust.trust_enabled() is True
+
+
+async def test_ext_method_approval_set_native_or_all_clears_marker(tmp_path, monkeypatch):
+    """离开 none 必须删标记 —— 留着会让下次启动又折回 none（env 未显式时）。"""
+    from agentd import trust
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    marker = tmp_path / "trust_all.json"
+    monkeypatch.setattr(trust, "trust_file", lambda: marker)
+    trust.enable_trust()  # 前提：当前处于完全信任
+    agent, kernel = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+    kernel.set_approval_policy("none")
+
+    assert await agent.ext_method("approval", {"policy": "native"}) == {"policy": "native"}
+    assert kernel.approval_policy == "native"
+    assert trust.trust_enabled() is False
+
+    trust.enable_trust()
+    kernel.set_approval_policy("none")
+    assert await agent.ext_method("approval", {"policy": "all"}) == {"policy": "all"}
+    assert kernel.approval_policy == "all"
+    assert trust.trust_enabled() is False
+
+
+async def test_ext_method_approval_rejects_unknown(tmp_path):
+    """拼错策略 / 拼错方法名都要当场抛，不能静默吞掉。"""
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    agent, _ = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+    with pytest.raises(ValueError, match="未知审批策略"):
+        await agent.ext_method("approval", {"policy": "typo"})
+    with pytest.raises(ValueError, match="未知扩展方法"):
+        await agent.ext_method("something_else", {})
+
+
 async def _raise(*_a, **_kw):
     raise RuntimeError("client does not support session/request_permission")
 
