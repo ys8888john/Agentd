@@ -43,6 +43,7 @@ from ..contracts import (
     ToolCallDone,
     ToolCallStart,
 )
+from .. import trust
 from ..kernel.kernel import AgentKernel
 from ..kernel.routing import UI_MODES, normalize_mode
 from ..kernel.tools import ApprovalRequest, ApproveHandler
@@ -82,14 +83,17 @@ _ACP_KIND = {
 }
 _ACP_STATUS = {"completed": "completed", "failed": "failed", "cancelled": "failed"}
 
-# 审批弹窗给用户的三个选项。option_id 是我们自己定的字符串，
+# 审批弹窗给用户的四个选项。option_id 是我们自己定的字符串，
 # 客户端只负责把它原样回传（见 _make_approver 里的解析）。
+# trust_all 的 kind 借用 allow_always（ACP 只有四档 kind，它确实"总是允许"），
+# 界面侧靠 option_id 把它和"本会话总是允许"区分开（不同样式 + 撤销提示）。
 _PERMISSION_OPTIONS = (
     PermissionOption(option_id="allow_once", name="允许一次", kind="allow_once"),
     PermissionOption(option_id="allow_session", name="本会话总是允许", kind="allow_always"),
+    PermissionOption(option_id="trust_all", name="完全信任（永不再问）", kind="allow_always"),
     PermissionOption(option_id="reject", name="拒绝", kind="reject_once"),
 )
-_ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session"})
+_ALLOW_OPTION_IDS = frozenset({"allow_once", "allow_session", "trust_all"})
 
 # 会话模式给客户端看的名字。id 与内核 Mode.name 严格一致（set_session_mode
 # 收到的就是它），name/description 是给人看的。
@@ -260,7 +264,8 @@ class AgentdAcpAgent(Agent):
 
         踩过的坑：**客户端可能根本没实现 session/request_permission**（ACP 的
         clientCapabilities 里有这一项）。这时 request_permission 会一直等不到响应
-        或者直接报错。所以这里三件事一起做：问之前先查"本会话总是允许"的记忆、
+        或者直接报错。所以这里几件事一起做：先看策略是不是 "none"（无人值守或
+        用户点过「完全信任」，直接放行不打扰）、再查"本会话总是允许"的记忆、
         出错就按拒绝处理并打日志、把结果原样翻译成 bool。
         """
 
@@ -270,6 +275,12 @@ class AgentdAcpAgent(Agent):
                 # 下一个边界收尾。别让"点了停止之后工具还在跑"变得可能。
                 self._log(f"[agentd] 已停止，跳过审批：{req.tool}")
                 return False
+            if self._kernel.approval_policy == "none":
+                # 无人值守（AGENTD_TOOLS_APPROVE=none）或用户点过「完全信任」
+                # （_enable_trust_all 当场热翻的）。正常情况下 needs_approval
+                # 已经先返回 False，approver 根本不会被叫；这里兜住所有入口 ——
+                # 真被叫到也必须直接放行，不能再弹一次窗。
+                return True
             granted = self._allow_all.setdefault(session_id, set())
             if req.tool in granted:
                 return True  # 之前选过"本会话总是允许"，不再打扰用户
@@ -295,6 +306,8 @@ class AgentdAcpAgent(Agent):
                 option_id = str(getattr(outcome, "option_id", "") or "")
                 if option_id == "allow_session":
                     granted.add(req.tool)
+                elif option_id == "trust_all":
+                    self._enable_trust_all()
                 return option_id in _ALLOW_OPTION_IDS
             # "cancelled"（用户关掉弹窗）或任何没见过的形状 —— 一律不放行。
             # 审批这种东西，拿不准的时候必须往"拒绝"倒，反过来就是安全漏洞。
@@ -302,6 +315,23 @@ class AgentdAcpAgent(Agent):
             return False
 
         return approve
+
+    def _enable_trust_all(self) -> None:
+        """用户点了「完全信任（永不再问）」：落盘 + 当场关掉本进程全部审批。
+
+        两步的顺序有意为之：**先翻内存策略**（用户看得见的效果），再落盘
+        （重启后的效果）。落盘失败不收回内存里的信任 —— 用户意图明确，
+        但日志必须说清楚"这次重启后会回来问"，两种后果不能含混。
+        """
+        self._kernel.set_approval_policy("none")
+        try:
+            path = trust.enable_trust()
+            self._log(f"[agentd] 已开启完全信任：后续所有工具调用不再询问（标记 {path}，删除可恢复）")
+        except OSError as exc:
+            self._log(
+                f"[agentd] 完全信任已对本进程生效，但标记写入失败（重启后会恢复提问）："
+                f"{type(exc).__name__}: {exc}"
+            )
 
     async def prompt(
         self, session_id: str, prompt: list[Any], **kwargs: Any

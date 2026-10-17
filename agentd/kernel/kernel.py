@@ -49,7 +49,7 @@ from .modes import (
 from .routing import normalize_mode
 from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
-from .tools import TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
+from .tools import POLICIES, TOOL_PROFILES, ApproveHandler, NativeToolbox, workspace_brief
 from .vision import VisionInterpreter
 
 class UnknownModeError(KeyError):
@@ -476,6 +476,20 @@ class AgentKernel:
 
     async def history(self, session_id: str) -> list[Message]:
         return await self.store.history(session_id)
+
+    def set_approval_policy(self, policy: str) -> None:
+        """热改审批策略。
+
+        存在的理由：用户在审批弹窗点「完全信任（永不再问）」后，要求**立刻**、
+        **全局**（当前进程所有会话、含本轮剩下的工具调用、含计划模式审批门）
+        不再提问 —— 等重启才生效等于没这个按钮。传输层点完按钮调这里。
+
+        只接受 tools.POLICIES 里的合法值；拼错直接抛，让调用方的 bug 当场暴露，
+        而不是静默退回默认策略造成"以为关了其实没关"。
+        """
+        if policy not in POLICIES:
+            raise ValueError(f"未知审批策略：{policy!r}（可选 {POLICIES}）")
+        self.approval_policy = policy
 
     async def validate(self, session_id: str, mode: str) -> None:
         """提前校验参数（会话存在 + 模式已注册），失败抛 UnknownSessionError / UnknownModeError。

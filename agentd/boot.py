@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import trust
 from .kernel.context import (
     DEFAULT_COMPACT_RATIO,
     NO_TRIM,
@@ -46,6 +47,11 @@ from .kernel.store import (
 )
 
 ENV_PREFIXES = ("AGENTD_", "FORGEAGENT_")
+
+# 「这个配置项压根没被设过」的哨兵。用来区分"用户显式设了 native"和
+# "没设、走默认 native"—— 后者才允许被「完全信任」标记折成 none。
+# 用对象身份判等（is），不怕用户真把环境变量设成这个字符串。
+_UNSET = object()
 
 
 def _env(name: str, default: str) -> str:
@@ -185,6 +191,14 @@ def _build_settings(val: Callable[[str, str], str]) -> Settings:
     - current_settings 传 _hot_val（程序化 override > 启动真实环境变量 > 重新解析的 .env > 默认），
       用来热加载。
     """
+    # 审批策略要区分「显式设过」和「没设走默认」—— 只有后者会被「完全信任」
+    # 标记（trust.py）折成 none。哨兵 _UNSET 穿过 val 的各档来源原样返回，
+    # 拿到字符串（含启动快照 _INITIAL_ENV）就算显式。
+    _approve_raw = val("AGENTD_TOOLS_APPROVE", _UNSET)
+    _approve = trust.effective_approval_policy(
+        _approve_raw.lower() if isinstance(_approve_raw, str) else "native",
+        explicit=isinstance(_approve_raw, str),
+    )
     return Settings(
         backend=val("AGENTD_LLM_BACKEND", "ollama"),
         ollama_host=val("AGENTD_OLLAMA_HOST", "http://localhost:11434"),
@@ -223,8 +237,11 @@ def _build_settings(val: Callable[[str, str], str]) -> Settings:
         # 越界读 .ssh / 系统配置这种事，出一次就够吓人了，放开要显式声明。
         tools_allow_outside=val("AGENTD_TOOLS_ALLOW_OUTSIDE", "false").lower() == "true",
         tools_timeout=float(val("AGENTD_TOOLS_TIMEOUT", "30")),
-        # 默认只拦原生写/执行类（+ MCP 自己标了 destructive 的工具），见 tools.needs_approval
-        tools_approve=val("AGENTD_TOOLS_APPROVE", "native").lower(),
+        # 默认只拦原生写/执行类（+ MCP 自己标了 destructive 的工具），见 tools.needs_approval。
+        # 「完全信任」标记（用户在审批弹窗点出来的，~/.agentd/trust_all.json，见 trust.py）：
+        # 显式设了 AGENTD_TOOLS_APPROVE（环境/.env/热配置/启动快照都算）以配置为准，
+        # 没显式设而标记在 → 折成 none，重启也不恢复提问。
+        tools_approve=_approve,
     )
 
 

@@ -94,7 +94,8 @@ curl -s localhost:8765/v1/sessions/sess_…/permission \
 | `AGENTD_TOOLS` | 原生工具范围：`native` / `read_only` / `off` | `native` |
 | `AGENTD_TOOLS_ALLOW_OUTSIDE` | 允许原生工具访问 cwd 之外的路径 | `false` |
 | `AGENTD_TOOLS_TIMEOUT` | `run_command` 默认超时（秒） | `30` |
-| `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none` | `native` |
+| `AGENTD_TOOLS_APPROVE` | 审批策略：`native` / `all` / `none`（显式设置高于 `trust_all.json` 标记） | `native` |
+| `~/.agentd/trust_all.json` | 存在即代表"完全信任"已开（等价于 `none`），由 GUI 的「完全信任」按钮写入；删除即恢复提问 | 不存在 |
 | `AGENTD_SEARCH_ENDPOINT` | `web_search` 的搜索后端地址 | `https://cn.bing.com/search` |
 | `AGENTD_SOGOU_ENDPOINT` | `web_search` 的搜狗兜底后端地址 | `https://www.sogou.com/web` |
 | `AGENTD_VISION_BASE_URL` / `_HOST` | 视觉转译模型的端点（`_HOST` 走 Ollama 原生，二选一） | 空（= 功能关） |
@@ -544,11 +545,21 @@ MCP 协议里没有 ACP 的 kind 概念，所以只能从 `annotations` 反推�
 ### 审批
 
 会改变外部状态的动作在**真正执行前**停下来问一次。ACP 侧走
-`session/request_permission`，弹三个选项：允许一次 / 本会话总是允许 / 拒绝。
+`session/request_permission`，弹四个选项：
+
+- **允许一次**：本次放行，下次还问；
+- **本会话总是允许**：记住该工具名（记忆在传输层，换客户端可换策略），本会话不再打扰；
+- **完全信任（永不再问）**：本进程内立刻把所有工具改为"免审批"，并写一个标记文件
+  `~/.agentd/trust_all.json`，**重启后仍生效**；
+- **拒绝**：不执行，工具收到 `[错误] 用户拒绝执行 xxx`。
 
 - **只读动作（`read` / `search` / `fetch`）在任何策略下都不弹。** 每个 `ls` 都弹窗，
   用户三分钟就学会无脑点"允许"，审批本身也就废了。联网工具归在只读这一侧，理由见上面。
 - 选过"本会话总是允许"的工具名会被记住（记忆在传输层，换客户端可以换策略）。
+- **完全信任的优先级**：显式 `AGENTD_TOOLS_APPROVE`（env / `.env` / GUI 覆盖 / 启动快照）
+  高于标记文件，标记文件高于默认的 `native`。也就是说，你既然用了 env 管策略，点出来的
+  "永不再问"就不该覆盖它；反过来，没设 env 的普通 GUI 用户点一下就能彻底关掉审批。
+  **撤销方式**：删掉 `~/.agentd/trust_all.json`，或设 `AGENTD_TOOLS_APPROVE=native` 重启。
 - 审批通道出错 / 客户端没实现该能力 / 用户关掉弹窗，**一律按拒绝处理**。
   审批这种拿不准的事必须往"拒绝"倒，反过来就是安全漏洞。
 - 被拒后工具输出 `[错误] 用户拒绝执行 xxx`、`status=cancelled`，模型能看到这条

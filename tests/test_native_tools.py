@@ -1174,7 +1174,12 @@ async def test_acp_request_permission_allow_once(tmp_path):
     assert call["tool_call"].kind == "execute"
     assert call["tool_call"].raw_input == {"detail": "command: ls"}
     # option_id 是我们自己定义的字符串，客户端只原样回传
-    assert {o.option_id for o in call["options"]} == {"allow_once", "allow_session", "reject"}
+    assert {o.option_id for o in call["options"]} == {
+        "allow_once",
+        "allow_session",
+        "trust_all",
+        "reject",
+    }
 
 
 async def test_acp_request_permission_cancelled_means_denied(tmp_path):
@@ -1210,6 +1215,62 @@ async def test_acp_permission_failure_is_denied(tmp_path):
     approve = agent._make_approver("sess_1")  # noqa: SLF001
 
     assert await approve(ApprovalRequest(call_id="c1", tool="edit", title="edit", kind="edit")) is False
+
+
+async def test_acp_trust_all_disables_approval_process_wide(tmp_path, monkeypatch):
+    """点了「完全信任」：本次放行 + 落盘 + 内核策略热翻 none + 从此不再问。
+
+    三个层次逐一钉死：
+    1. 本次调用返回 True（用户刚用这个选项批准了它）；
+    2. 标记文件写盘（重启后依然信任，见 tests/test_trust.py 的 boot 接线）；
+    3. kernel.approval_policy 当场变 "none" —— 换个会话再问也是直接放行，
+       不再弹窗（_allow_all 那种按会话记忆可做不到这一点）。
+    """
+    from agentd import trust
+
+    marker = tmp_path / "trust_all.json"
+    monkeypatch.setattr(trust, "trust_file", lambda: marker)
+    conn = _FakeConn(outcome="selected", option_id="trust_all")
+    agent, kernel = _agent_with(conn, tmp_path, [{"text": "x"}])
+    approve = agent._make_approver("sess_1")  # noqa: SLF001
+    req = ApprovalRequest(call_id="c1", tool="run_command", title="run_command", kind="execute")
+
+    assert kernel.approval_policy == "native"  # 前提：默认是要问的
+    assert await approve(req) is True
+    assert marker.is_file() and trust.trust_enabled() is True
+    assert kernel.approval_policy == "none"
+
+    # 另一个会话的审批器也必须直接放行 —— 信任是进程级的，不是按会话记忆
+    other = agent._make_approver("sess_2")  # noqa: SLF001
+    assert await other(req) is True
+    assert len(conn.permission_calls) == 1  # 从头到尾只问了一次
+
+
+async def test_acp_policy_none_short_circuits_approver(tmp_path):
+    """无人值守（AGENTD_TOOLS_APPROVE=none）时 approver 直接放行不弹窗。
+
+    正常情况下 needs_approval 已经先返回 False，approver 不会被叫；这条测试
+    钉的是"真被叫到"时的兜底行为 —— 放行，而不是又弹一次窗。
+    """
+    conn = _FakeConn()
+    agent, kernel = _agent_with(conn, tmp_path, [{"text": "x"}])
+    kernel.set_approval_policy("none")
+    approve = agent._make_approver("sess_1")  # noqa: SLF001
+
+    assert await approve(ApprovalRequest(call_id="c1", tool="edit", title="edit", kind="edit")) is True
+    assert conn.permission_calls == []
+
+
+def test_kernel_set_approval_policy_rejects_unknown():
+    """拼错策略必须当场抛 —— 静默退回默认会造成"以为关了其实没关"。"""
+    from agentd.kernel.kernel import AgentKernel
+    from agentd.kernel.llm import ScriptLLM
+
+    kernel = AgentKernel(llm=ScriptLLM([[LLMText("x")]]))
+    kernel.set_approval_policy("none")
+    assert kernel.approval_policy == "none"
+    with pytest.raises(ValueError, match="未知审批策略"):
+        kernel.set_approval_policy("typo")
 
 
 async def _raise(*_a, **_kw):
