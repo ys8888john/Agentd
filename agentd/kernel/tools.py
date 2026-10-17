@@ -46,6 +46,7 @@ from typing import Any, Literal
 
 import httpx
 
+from ._job import ProcessTree
 from .blobstore import tool_results_root
 
 # ACP ToolKind 的子集：原生工具只用到这几个。
@@ -1592,6 +1593,11 @@ async def _make_xlsx(args: dict, rt: ToolRuntime) -> str:
     )
 
 
+# 超时杀完进程树后，等 proc.wait() 返回的上限（秒）。正常情况下杀树→管道
+# EOF→wait() 即刻返回；这个上限只是防脏状态挂死整轮 prompt 的兜底。
+_WAIT_AFTER_KILL = 5.0
+
+
 async def _run_command(args: dict, rt: ToolRuntime) -> str:
     command = str(args.get("command") or "").strip()
     if not command:
@@ -1617,26 +1623,42 @@ async def _run_command(args: dict, rt: ToolRuntime) -> str:
     except OSError as exc:
         return err(f"起 shell 失败：{type(exc).__name__}: {exc}")
 
+    # 把整棵进程树圈进 Job（Windows）：cmd 里再起的孙进程（超时不退的 MSYS
+    # pwd.exe 就这德行）必须连锅端。否则孤儿持管道写端，Windows 上
+    # proc.wait() 要等管道 EOF 才返回（base_subprocess._call_connection_lost），
+    # 实测挂死 30s+，整轮 prompt 被拖到 900s cancel 才收场。详见 _job.py 模块文档。
+    # Job 不可用（非 Windows / 建 Job 失败）时降级为老行为，由下方有界 wait 兜底。
+    tree = ProcessTree.attach(proc.pid)
     try:
-        out, out_err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:  # py3.11 起 asyncio.TimeoutError 就是内置 TimeoutError
-        with contextlib.suppress(ProcessLookupError, OSError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return err(f"命令超时（超过 {timeout:g}s）已被终止：{command}")
+        try:
+            out, out_err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:  # py3.11 起 asyncio.TimeoutError 就是内置 TimeoutError
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+            if tree is not None:
+                tree.kill_tree()  # 孙进程一起杀，管道 EOF，wait() 才会返回
+            # 有界兜底：杀完树正常情况下 wait() 立即返回；真遇到脏状态（比如
+            # 降级路径下孤儿持管道）也别挂死整轮 prompt，最多再等这几秒。
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=_WAIT_AFTER_KILL)
+            return err(f"命令超时（超过 {timeout:g}s）已被终止：{command}")
 
-    stdout = out.decode("utf-8", "replace")
-    stderr = out_err.decode("utf-8", "replace")
-    merged = stdout
-    if stderr.strip():
-        merged = (merged + ("\n" if merged and not merged.endswith("\n") else "") + "[stderr]\n" + stderr)
-    body = _clip(merged, rt.max_bytes, what="命令输出") or "（无输出）"
+        stdout = out.decode("utf-8", "replace")
+        stderr = out_err.decode("utf-8", "replace")
+        merged = stdout
+        if stderr.strip():
+            merged = (merged + ("\n" if merged and not merged.endswith("\n") else "") + "[stderr]\n" + stderr)
+        body = _clip(merged, rt.max_bytes, what="命令输出") or "（无输出）"
 
-    # 非零退出码按失败上报：AgentMode 靠 [错误] 前缀把 status 记成 failed
-    if proc.returncode:
-        return err(f"命令退出码 {proc.returncode}：{command}\n{body}")
-    return f"exit=0：{command}\n{body}"
+        # 非零退出码按失败上报：AgentMode 靠 [错误] 前缀把 status 记成 failed
+        if proc.returncode:
+            return err(f"命令退出码 {proc.returncode}：{command}\n{body}")
+        return f"exit=0：{command}\n{body}"
+    finally:
+        # 正常路径也关 Job：命令回来了还挂着的成员（detached 孙进程）一并终结，
+        # 不留孤儿持管道。语义 = run_command 结束即整棵树结束。
+        if tree is not None:
+            tree.close()
 
 
 async def _load_skill(args: dict, rt: ToolRuntime) -> str:

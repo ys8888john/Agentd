@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -392,6 +393,99 @@ async def test_run_command_uses_cwd_relative_to_session_root(tmp_path):
         "run_command", json.dumps({"command": f'"{sys.executable}" "{script}"', "cwd": "sub"})
     )
     assert "marker.txt" in out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows asyncio 子进程退出检测的回归")
+async def test_run_command_timeout_kills_grandchild_tree(tmp_path):
+    """超时不能只杀 shell：孙进程必须一起死，否则 proc.wait() 挂死整轮 prompt。
+
+    事故还原（2026-10-14「总是允许还是卡住」）：cmd 派生的 MSYS pwd.exe 挂起
+    不退出，proc.kill() 只杀 cmd，孤儿继续持有 stdout/stderr 管道写端；而
+    Windows 上 asyncio 的 proc.wait() 要等所有管道 EOF 才返回
+    （base_subprocess._call_connection_lost 才唤醒 waiters），于是无限期挂死。
+    """
+    from agentd.kernel._job import pid_alive
+
+    bg = tmp_path / "bg.py"
+    pidfile = tmp_path / "bg.pid"
+    bg.write_text(
+        "import os, time\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    tb = box(tmp_path, timeout=0.6)
+    # 孙进程经 cmd 的 start 派生且继承管道写端 —— 与事故中的 pwd.exe 同构
+    cmd = f'cmd /c start "" /b /wait "{sys.executable}" "{bg}"'
+    # 外层 wait_for 是保险丝：万一 wait() 真挂死，让测试快速失败而不是挂住 CI
+    out = await asyncio.wait_for(
+        tb.call("run_command", json.dumps({"command": cmd})), timeout=20
+    )
+    assert out.startswith("[错误]") and "超时" in out
+
+    bgpid = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if pidfile.exists():
+            bgpid = int(pidfile.read_text())
+            break
+        await asyncio.sleep(0.05)
+    assert bgpid is not None, "孙进程没起来，测试场景没构造对"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and pid_alive(bgpid):
+        await asyncio.sleep(0.05)
+    assert not pid_alive(bgpid), "超时后孙进程成了孤儿，proc.wait() 会挂死"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Job object 是 Windows 专有机制")
+async def test_process_tree_kills_whole_tree(tmp_path):
+    """ProcessTree.attach 后 kill_tree 必须连孙进程一起杀（run_command 修复的地基）。"""
+    from agentd.kernel._job import ProcessTree, pid_alive
+
+    pid_c, pid_g = tmp_path / "c.pid", tmp_path / "g.pid"
+    grand = tmp_path / "grand.py"
+    grand.write_text(
+        "import os, time\n"
+        f"open({str(pid_g)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    # 直接子进程再 Popen 一个孙进程，且不重定向管道 —— 孙进程天然持有
+    # create_subprocess_shell 的 stdout/stderr 写端，正是挂死场景
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, subprocess, sys, time\n"
+        f"open({str(pid_c)!r}, 'w').write(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, {str(grand)!r}])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    proc = await asyncio.create_subprocess_shell(
+        f'"{sys.executable}" "{child}"',
+        cwd=str(tmp_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    tree = ProcessTree.attach(proc.pid)
+    try:
+        assert tree is not None, "Windows 上 attach 不该失败"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (pid_c.exists() and pid_g.exists()):
+            await asyncio.sleep(0.05)
+        assert pid_c.exists() and pid_g.exists(), "子孙进程没起来，场景没构造对"
+        cpid, gpid = int(pid_c.read_text()), int(pid_g.read_text())
+
+        tree.kill_tree()
+        # shell 的 wait() 也必须及时返回：管道 EOF 后 _call_connection_lost 唤醒
+        await asyncio.wait_for(proc.wait(), timeout=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (pid_alive(cpid) or pid_alive(gpid)):
+            await asyncio.sleep(0.05)
+        assert not pid_alive(cpid), "直接子进程没被杀掉"
+        assert not pid_alive(gpid), "孙进程没被杀掉 —— 这正是事故根因"
+    finally:
+        if tree is not None:
+            tree.close()
 
 
 # ---- make_xlsx ----
