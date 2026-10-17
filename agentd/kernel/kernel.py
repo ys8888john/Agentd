@@ -37,7 +37,15 @@ from .context import (
 )
 from .memory import MemoryFile, compact, render_memory_block
 from .models import Message, ToolRecord
-from .modes import AgentMode, AskMode, Mode, ModeContext, PlanMode, SingleMode
+from .modes import (
+    PLAN_ENTRY_GUIDE,
+    AgentMode,
+    AskMode,
+    Mode,
+    ModeContext,
+    PlanMode,
+    SingleMode,
+)
 from .routing import normalize_mode
 from .skills import index_section
 from .store import InMemorySessionStore, SessionStore, UnknownSessionError
@@ -227,6 +235,12 @@ class AgentKernel:
             # 不值得为它加 try 层。
             if "load_skill" in tools:
                 sections.append(index_section(cwd or None))
+            # 计划入口指引：enter_plan_mode 真在工具箱里时才注入（Ask / 只读 /
+            # off 档没有它，给了也调不了）。工具描述管"这一个工具怎么用"，
+            # 这一段管"什么时候该想到它"—— 只靠工具描述，小模型常常整个回合
+            # 都想不起来自己还能自主进计划，用户看到的还是"直接开干"。
+            if "enter_plan_mode" in tools:
+                sections.append(PLAN_ENTRY_GUIDE)
         return compose_system(self.system, sections)
 
     async def _maybe_compact(self, session_id: str, rows: list[Message]) -> None:

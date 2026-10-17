@@ -25,9 +25,19 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import ClassVar
 
-from ...contracts import Event, MessageDelta, MessageDone, Notice, ThoughtDelta, ToolCallDone, ToolCallStart
+from ...contracts import (
+    Event,
+    MessageDelta,
+    MessageDone,
+    Notice,
+    PlanUpdate,
+    ThoughtDelta,
+    ToolCallDone,
+    ToolCallStart,
+)
 from ..blobstore import externalize
 from ..llm import LLMNotice, LLMText, LLMThought, LLMToolCall
 from ..mcp import McpHub, ToolBinding
@@ -40,6 +50,7 @@ from ..tools import (
     needs_approval,
 )
 from .base import Mode, ModeContext
+from .plan import execute_steps, plan_approval, plan_entries, plan_preamble
 
 # 工具循环上限：防模型来回调不停（每次循环至少一次 LLM 调用）。
 # 12 步对"多来源搜索 + 整理成文件"这类任务偏紧（2026-10-09 实测航班任务
@@ -223,10 +234,17 @@ class AgentMode(Mode):
                 messages.append(announce)
                 yield announce
 
+                # 模型自主进入计划：本回合内转换。同批次里其余调用照常跑完
+                # （半途丢下它们会在历史里留下"举手要调工具却没有工具响应"的
+                # 残缺片段，下次重建上下文会被整段消毒掉），全部跑完再转交。
+                plan_call: LLMToolCall | None = None
                 for call in calls:
                     if ctx.cancelled():
                         break
+                    call_output = ""
                     async for event in self._dispatch(ctx, hub, call):
+                        if isinstance(event, ToolCallDone):
+                            call_output = event.output
                         if isinstance(event, Message):
                             # 工具结果也是同样的两条路：append 进本地列表让本轮
                             # 的 LLM 立刻看到，yield 出去让内核落库留给下一轮。
@@ -234,11 +252,27 @@ class AgentMode(Mode):
                             yield event
                         else:
                             yield event
+                    if (
+                        plan_call is None
+                        and call.name == "enter_plan_mode"
+                        and not call_output.startswith(ERROR_PREFIX)
+                    ):
+                        plan_call = call
 
                 if ctx.cancelled():
                     final_text = last_text or "（已手动停止）"
                     stopped = True
                     break
+
+                if plan_call is not None:
+                    # 转交计划阶段（审批门 + 逐条执行，与 PlanMode 共用阶段
+                    # 函数），跑完直接收尾 —— 最后一步的 MessageDone 就是本
+                    # 回合的结束语，不再走下面的软/硬护栏与收尾逻辑。
+                    async for event in self._run_plan_flow(
+                        ctx, messages, plan_call, user_input
+                    ):
+                        yield event
+                    return
 
                 # 软护栏：步数快烧完时注入收敛指令 —— 只 append 进本轮上下文，
                 # 不 yield（不落库、界面看不到）。下一次 LLM 调用就会看到它，
@@ -295,6 +329,60 @@ class AgentMode(Mode):
                 run_id=ctx.run_id,
                 text=closing,
             )
+
+    # ---- 模型自主进入计划（回合内转换）----
+
+    async def _run_plan_flow(
+        self,
+        ctx: ModeContext,
+        messages: list[Message],
+        call: LLMToolCall,
+        user_input: str,
+    ) -> AsyncIterator[Event | Message]:
+        """模型调了 enter_plan_mode 且成功返回：把本轮余下部分转交计划阶段。
+
+        与 PlanMode.run 的后半段同构（同一批阶段函数），差别只在活上下文：
+        这里用本轮局部的 messages（里面已经有 announce、工具结果），PlanMode
+        用 ctx.history 本身。所以先换一个 history=messages 的上下文副本 ——
+        步骤里的 agent 循环启动时才看得到本轮此前的工具往返；plan_depth +1
+        让步骤里再调 enter_plan_mode 被 _dispatch 的闸挡掉。
+
+        参考 WorkBuddy 的 EnterPlanMode / ExitPlanMode：判断交给模型（工具
+        描述 + PLAN_ENTRY_GUIDE 引导），不搞关键词正则；但不照搬它的持久
+        权限模式切换 —— 这里计划流转是当回合内的行为，回合结束即回到用户
+        选的那档，不会粘住后续所有回合。
+        """
+        try:
+            args = json.loads(call.arguments) if call.arguments else {}
+        except ValueError:
+            args = {}
+        plan_text = str(args.get("plan") or "") if isinstance(args, dict) else ""
+
+        plan_ctx = replace(ctx, history=messages, plan_depth=ctx.plan_depth + 1)
+        entries, hints = plan_entries(plan_text, user_input or "")
+        for hint in hints:
+            yield Notice(session_id=ctx.session_id, run_id=ctx.run_id, text=hint)
+
+        async for event in plan_preamble(plan_ctx, entries):
+            if isinstance(event, Message):
+                messages.append(event)
+            yield event
+
+        if not await plan_approval(plan_ctx, entries):
+            yield Notice(
+                session_id=ctx.session_id,
+                run_id=ctx.run_id,
+                text="用户取消了计划执行，未开始执行。",
+            )
+            yield MessageDone(
+                session_id=ctx.session_id, run_id=ctx.run_id, text="（计划未执行）"
+            )
+            return
+
+        async for event in execute_steps(self, plan_ctx, entries):
+            if isinstance(event, Message):
+                messages.append(event)
+            yield event
 
     # ---- 工具来源合并 ----
 
@@ -355,6 +443,32 @@ class AgentMode(Mode):
         else:
             # 名字没对上任何来源：不执行，但要走完 start/done 让客户端把卡片收掉
             title, kind, requires, destructive = call.name, "other", False, False
+
+        # 计划执行中（plan_depth > 0）不允许再开计划：步骤里的模型再调
+        # enter_plan_mode 会层层嵌套，把步数护栏和用户的耐心一起烧穿。
+        # 合成一条错误结果，不走审批、不执行 —— 与下面只读闸同一个思路：
+        # 明确拒绝比让它白等一次往返、换个工具重试好。
+        if call.name == "enter_plan_mode" and ctx.plan_depth > 0:
+            output = (
+                f"{ERROR_PREFIX}当前正在按计划逐步执行，不能再开启新的计划。"
+                "请直接完成当前这一步骤。"
+            )
+            yield ToolCallStart(
+                session_id=ctx.session_id,
+                run_id=ctx.run_id,
+                call_id=call.id,
+                title=title,
+                kind=kind,  # type: ignore[arg-type]
+            )
+            yield ToolCallDone(
+                session_id=ctx.session_id,
+                run_id=ctx.run_id,
+                call_id=call.id,
+                status="cancelled",
+                output=output,
+            )
+            yield Message.tool(output, tool_call_id=call.id, name=call.name)
+            return
 
         # 只读档（Ask 模式）的第二道闸。schema 里已经剔掉了非只读工具，
         # 这里防的是模型幻觉出一个工具名硬调（小模型常见），以及 MCP

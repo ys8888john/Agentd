@@ -48,9 +48,12 @@ import httpx
 
 from .blobstore import tool_results_root
 
-# ACP ToolKind 的子集：原生工具只用到这几个
-# （其余 delete/move/think/switch_mode 留给以后，声明了也没工具用得上）。
-Kind = Literal["read", "edit", "search", "execute", "fetch", "other"]
+# ACP ToolKind 的子集：原生工具只用到这几个。
+# switch_mode 从"留给以后"转正：enter_plan_mode（模型自主进计划模式）就是它 ——
+# 模式切换不是读写执行，徽章别冒充工具（见 contracts.ToolKind 全集）。
+Kind = Literal[
+    "read", "edit", "search", "execute", "fetch", "switch_mode", "other"
+]
 
 ERROR_PREFIX = "[错误] "
 
@@ -1840,6 +1843,26 @@ async def _generate_image(args: dict, rt: ToolRuntime) -> str:
     )
 
 
+async def _enter_plan_mode(args: dict, rt: ToolRuntime) -> str:
+    """模型自主进入计划模式：把编号计划交出来，经用户确认后逐步执行。
+
+    只做校验与确认 —— 真正的计划渲染 / 审批 / 逐步执行由 AgentMode 在工具
+    返回后接管（工具处理器只返回文本，发不出事件，见 Handler 签名与
+    AgentMode._run_plan_flow）。设计参考 WorkBuddy 的 EnterPlanMode /
+    ExitPlanMode：判断交给模型（工具描述 + 系统提示词引导），不搞关键词正则。
+    """
+    plan = str(args.get("plan") or "").strip()
+    if not plan:
+        return err(
+            "plan 不能为空。按「序号. 步骤内容」每行一条写出 3~8 步的计划，"
+            "例如：1. 列出工作目录里的文件\\n2. 读取 config.json 并确认端口配置。"
+        )
+    return (
+        "已收到计划。接下来会把计划呈现给用户确认；用户确认后逐步执行，"
+        "每步开始前计划卡会亮出进度。在得到确认之前，不要执行任何修改性动作。"
+    )
+
+
 _SPECS: tuple[NativeTool, ...] = (
     NativeTool(
         name="read_file",
@@ -2093,6 +2116,35 @@ _SPECS: tuple[NativeTool, ...] = (
         },
         handler=_generate_image,
         kind="other",
+        requires_permission=False,
+    ),
+    NativeTool(
+        name="enter_plan_mode",
+        description=(
+            "进入计划模式：把任务拆成编号计划交给用户确认，确认后逐步执行。"
+            "**当请求符合以下任一情况、且你还没有开始做修改性动作时，优先调用本工具**："
+            "需求范围不明或有多重理解；任务要 3 步以上才能完成；涉及写文件、改代码、"
+            "跑命令等有外部影响的动作；用户明确说「先出个计划 / 方案」。"
+            "调用前可以先做只读调研（读文件 / 搜索 / 抓取），但不要做任何修改性动作 —— "
+            "计划的意义就是让用户在动手前有机会叫停。"
+            "已经在按某条计划逐步执行时不能再调本工具（会被拒绝），直接完成当前步骤即可。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "description": (
+                        "3~8 步的编号计划，每行一条，格式为「序号. 步骤内容」，"
+                        "例如 \"1. 列出工作目录里的文件\\n2. 读取 config.json 并确认端口配置\"；"
+                        "每步是一个能独立执行完的动作，说清做什么、做到什么程度。"
+                    ),
+                },
+            },
+            "required": ["plan"],
+        },
+        handler=_enter_plan_mode,
+        kind="switch_mode",
         requires_permission=False,
     ),
 )

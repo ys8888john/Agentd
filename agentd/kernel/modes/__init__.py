@@ -6,7 +6,7 @@
 from .agent import AgentMode
 from .ask import AskMode
 from .base import Mode, ModeContext
-from .plan import PlanMode
+from .plan import PLAN_ENTRY_GUIDE, PlanMode
 from .single import SingleMode
 
 __all__ = [
@@ -16,4 +16,5 @@ __all__ = [
     "AgentMode",
     "AskMode",
     "PlanMode",
+    "PLAN_ENTRY_GUIDE",
 ]

@@ -55,6 +55,13 @@ class ModeContext:
     # 还会诱导它换个工具重试。
     read_only: bool = False
 
+    # 计划执行深度：0 = 普通 agent 回合；>0 = 正在计划模式的某一步里。
+    # 模型可以在一轮中途自主调 enter_plan_mode 转入计划执行（见 AgentMode），
+    # 每一步又是一轮完整的 agent 循环 —— 不记深度的话，步骤里的模型可以再开
+    # 一个计划，层层嵌套把步数护栏和用户的耐心一起烧穿。>0 时 enter_plan_mode
+    # 直接以错误结果回绝（见 AgentMode._dispatch 的闸）。
+    plan_depth: int = 0
+
     # 取消信号（asyncio.Event），由传输层造：一次 prompt 一个，收到 session/cancel
     # 时被 set。内核与模式在循环边界上查询，尽快收尾；None = 本轮不可取消
     # （TUI / 单测 / 老的 HTTP 调试口）。放 ModeContext 而不是 handle 参数逐层传，
