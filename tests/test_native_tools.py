@@ -1334,6 +1334,27 @@ async def test_ext_method_approval_rejects_unknown(tmp_path):
         await agent.ext_method("something_else", {})
 
 
+# ---- ext_method("lsp")：GUI 右侧面板的预留通道 ----
+
+
+async def test_ext_method_lsp_returns_not_connected_placeholder(tmp_path):
+    """agentd 当前无 LSP 集成：扩展方法返回「未接入」占位，不改任何状态。"""
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    agent, _ = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+    res = await agent.ext_method("lsp", {})
+    assert res == {"status": "未接入", "servers": []}
+
+
+async def test_ext_method_lsp_rejects_unknown_method(tmp_path):
+    """拼错方法名要当场抛（与 approval 同一纪律）。"""
+    from agentd.transports.acp_stdio import AgentdAcpAgent
+
+    agent, _ = _agent_with(_FakeConn(), tmp_path, [{"text": "x"}])
+    with pytest.raises(ValueError, match="未知扩展方法"):
+        await agent.ext_method("lsp_servers", {})
+
+
 async def _raise(*_a, **_kw):
     raise RuntimeError("client does not support session/request_permission")
 

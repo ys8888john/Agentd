@@ -336,10 +336,15 @@ class AgentdAcpAgent(Agent):
     async def ext_method(self, name: str, params: dict[str, Any]) -> Any:
         """ACP 扩展方法（SDK 把 ``_xxx`` 路由到这里，见 acp/agent/router.py）。
 
-        目前只有一个：``_approval``（审批状态查询 / 切换）。GUI 的状态下拉
-        用它做到「不重启 agentd 就能改审批策略」—— 内核策略当场热翻 +
-        trust_all.json 标记同步落/删，与弹窗里点「完全信任」走完全相同的
-        状态迁移，两处入口不会漂移出两种真相。
+        目前有两个：
+
+        - ``_approval``（审批状态查询 / 切换）。GUI 的状态下拉用它做到
+          「不重启 agentd 就能改审批策略」—— 内核策略当场热翻 +
+          trust_all.json 标记同步落/删，与弹窗里点「完全信任」走完全相同的
+          状态迁移，两处入口不会漂移出两种真相。
+        - ``_lsp``（LSP 状态查询，预留通道）。agentd 当前尚未接入任何语言
+          服务器，返回 ``{"status": "未接入", "servers": []}`` 占位；将来
+          真正挂载时在此聚合真实状态，GUI 预留面板自动点亮。
 
         - 无 ``policy`` = 查询：返回当前生效策略；
         - ``policy="none"``：全放行（等价点「完全信任」），写标记；
@@ -347,20 +352,26 @@ class AgentdAcpAgent(Agent):
           "信任"这一种状态，留在盘上会让下次启动把它折回 none（显式 env
           才能盖过它），所以凡是离开 none 都必须清掉。
         """
-        if name != "approval":
-            raise ValueError(f"未知扩展方法：_{name}")
-        policy = str(params.get("policy") or "").strip().lower()
-        if not policy:
+        if name == "approval":
+            policy = str(params.get("policy") or "").strip().lower()
+            if not policy:
+                return {"policy": self._kernel.approval_policy}
+            if policy == "none":
+                self._enable_trust_all()
+            elif policy in ("native", "all"):
+                self._kernel.set_approval_policy(policy)
+                trust.disable_trust()
+                self._log(f"[agentd] 审批策略切换为 {policy}（trust_all.json 标记已清除）")
+            else:
+                raise ValueError(f"未知审批策略：{policy!r}（可选 native / all / none）")
             return {"policy": self._kernel.approval_policy}
-        if policy == "none":
-            self._enable_trust_all()
-        elif policy in ("native", "all"):
-            self._kernel.set_approval_policy(policy)
-            trust.disable_trust()
-            self._log(f"[agentd] 审批策略切换为 {policy}（trust_all.json 标记已清除）")
-        else:
-            raise ValueError(f"未知审批策略：{policy!r}（可选 native / all / none）")
-        return {"policy": self._kernel.approval_policy}
+        if name == "lsp":
+            # 预留的 LSP 状态通道：agentd 当前尚未接入任何语言服务器
+            # （全仓 grep 确认无 LSP 集成），先返回「未接入」占位。将来
+            # 真正挂载语言服务器时，在此聚合各 server 的 name / state /
+            # 能力返回即可，GUI 侧预留面板会自动点亮，无需改前端结构。
+            return {"status": "未接入", "servers": []}
+        raise ValueError(f"未知扩展方法：_{name}")
 
     async def prompt(
         self, session_id: str, prompt: list[Any], **kwargs: Any
